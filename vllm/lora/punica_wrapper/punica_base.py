@@ -486,6 +486,9 @@ class PunicaWrapperBase(PunicaWrapperABC):
         fully_sharded: bool = False,
         offset: int = 0,
         token_lora_mapping: torch.Tensor | None = None,
+        add_inputs: bool = True,
+        a_row_mapping: torch.Tensor | None = None,
+        c_row_mapping: torch.Tensor | None = None,
     ):
         """
         Performs a fused forward computation for LoRA of
@@ -516,6 +519,7 @@ class PunicaWrapperBase(PunicaWrapperABC):
         use_tuned_config: bool,
         add_inputs: bool = True,
         token_lora_mapping: torch.Tensor | None = None,
+        c_row_mapping: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -556,6 +560,8 @@ class PunicaWrapperBase(PunicaWrapperABC):
         tp_rank: int,
         use_tuned_config: bool,
         add_inputs: bool = True,
+        row_mapping: torch.Tensor | None = None,
+        mul_routed_weight: bool = True,
     ) -> None:
         """Apply w2 LoRA to y (intermediate_cache3) in-place before moe_sum.
 

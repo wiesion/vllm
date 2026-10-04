@@ -68,6 +68,38 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
 
 
+def test_gemma4_mtp_defaults_to_v1_model_runner(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    config = VllmConfig()
+    config.model_config = SimpleNamespace(is_diffusion=False)
+    config.speculative_config = SimpleNamespace(
+        method="mtp",
+        use_gemma4_mtp=lambda: True,
+    )
+
+    with patch.object(current_platform, "is_xpu", return_value=True):
+        assert config.use_v2_model_runner is False
+
+    with (
+        patch.object(current_platform, "is_xpu", return_value=False),
+        patch.object(
+            VllmConfig,
+            "_is_default_v2_model_runner_model",
+            return_value=True,
+        ),
+        patch.object(
+            VllmConfig,
+            "_get_v2_model_runner_unsupported_features",
+            return_value=[],
+        ),
+        patch.object(vllm_config_module, "HAS_TRITON", True),
+    ):
+        assert config.use_v2_model_runner is True
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    assert config.use_v2_model_runner is True
+
+
 @pytest.mark.parametrize(
     ("use_v2_model_runner", "expected_capture_sizes"),
     [

@@ -48,6 +48,22 @@ def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch)
     assert envs.VLLM_P2P_SIDE_CHANNEL_PORT == 5799
 
 
+def test_sym_int4_weight_quant_backend(monkeypatch: pytest.MonkeyPatch):
+    env_name = "VLLM_SYM_INT4_WEIGHT_QUANT_BACKEND"
+    getter = environment_variables[env_name]
+
+    monkeypatch.delenv(env_name, raising=False)
+    assert getter() == "xpu_esimd"
+
+    for backend in ("cpu", "xpu_esimd"):
+        monkeypatch.setenv(env_name, backend)
+        assert getter() == backend
+
+    monkeypatch.setenv(env_name, "xpu")
+    with pytest.raises(ValueError, match="Valid options.*cpu.*xpu_esimd"):
+        getter()
+
+
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
     monkeypatch.setenv("VLLM_PORT", "1234")

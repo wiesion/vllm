@@ -14,6 +14,7 @@ from tests.ir.ir_test_utils import (
 )
 from tests.kernels.allclose_default import get_default_rtol
 from vllm import ir
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.platforms import current_platform
 
 rms_norm_native = ir.ops.rms_norm.impls["native"].impl_fn
@@ -164,6 +165,28 @@ def test_vllm_c_rms_norm_accepts_nd_input():
     assert_close(ir.ops.rms_norm, output, ref_output)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    not current_platform.is_xpu(),
+    reason="Mixed-dtype RMSNorm is supported by the XPU kernels provider",
+)
+def test_xpu_rms_norm_accepts_fp32_weight(dtype):
+    device = current_platform.device_type
+    x = torch.randn(8, 4096, device=device, dtype=dtype)
+    weight = torch.randn(4096, device=device, dtype=torch.float32)
+    epsilon = 1e-6
+    impl = ir.ops.rms_norm.impls["xpu_kernels"]
+
+    assert impl.supports_args(x, weight, epsilon)
+
+    ref_output = rms_norm_native(x, weight, epsilon)
+    with ir.ops.rms_norm.set_priority(["xpu_kernels", "native"]):
+        output = ir.ops.rms_norm(x, weight, epsilon)
+
+    assert output.dtype == dtype
+    assert_close(ir.ops.rms_norm, output, ref_output)
+
+
 fused_add_rms_norm_native = ir.ops.fused_add_rms_norm.impls["native"].impl_fn
 
 
@@ -216,6 +239,63 @@ def test_vllm_c_fused_add_rms_norm_accepts_nd_input():
     assert residual.shape == x_residual.shape
     assert_close(ir.ops.fused_add_rms_norm, output, ref_output)
     assert_close(ir.ops.fused_add_rms_norm, residual, ref_residual)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    not current_platform.is_xpu(),
+    reason="Mixed-dtype RMSNorm is supported by the XPU kernels provider",
+)
+def test_xpu_fused_add_rms_norm_accepts_fp32_weight(dtype):
+    device = current_platform.device_type
+    x = torch.randn(8, 4096, device=device, dtype=dtype)
+    x_residual = torch.randn_like(x)
+    weight = torch.randn(4096, device=device, dtype=torch.float32)
+    epsilon = 1e-6
+    impl = ir.ops.fused_add_rms_norm.impls["xpu_kernels"]
+
+    assert impl.supports_args(x, x_residual, weight, epsilon)
+    mismatched_residual = x_residual.to(
+        torch.bfloat16 if dtype == torch.float16 else torch.float16
+    )
+    assert not impl.supports_args(x, mismatched_residual, weight, epsilon)
+
+    ref_output, ref_residual = fused_add_rms_norm_native(x, x_residual, weight, epsilon)
+    with ir.ops.fused_add_rms_norm.set_priority(["xpu_kernels", "native"]):
+        output, residual = ir.ops.fused_add_rms_norm(x, x_residual, weight, epsilon)
+
+    assert output.dtype == dtype
+    assert residual.dtype == dtype
+    assert_close(ir.ops.fused_add_rms_norm, output, ref_output)
+    assert_close(ir.ops.fused_add_rms_norm, residual, ref_residual)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_xpu(),
+    reason="Gemma RMSNorm inplace behavior is XPU-specific",
+)
+def test_xpu_gemma_rms_norm_reuses_residual_inputs(default_vllm_config):
+    device = current_platform.device_type
+    layer = GemmaRMSNorm(4096).to(device=device)
+    layer.weight.data.normal_(mean=0.0, std=0.1)
+    x = torch.randn(8, 4096, device=device)
+    residual = torch.randn_like(x)
+    weight = layer.weight.float() + 1.0
+    ref_output, ref_residual = fused_add_rms_norm_native(
+        x.clone(), residual.clone(), weight, layer.variance_epsilon
+    )
+    impl = ir.ops.fused_add_rms_norm.impls["xpu_kernels"]
+    assert impl.supports_args(x, residual, weight, layer.variance_epsilon)
+    x_ptr = x.data_ptr()
+    residual_ptr = residual.data_ptr()
+
+    with ir.ops.fused_add_rms_norm.set_priority(["xpu_kernels", "native"]):
+        output, residual_out = layer(x, residual)
+
+    assert output.data_ptr() == x_ptr
+    assert residual_out.data_ptr() == residual_ptr
+    assert_close(ir.ops.fused_add_rms_norm, output, ref_output)
+    assert_close(ir.ops.fused_add_rms_norm, residual_out, ref_residual)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

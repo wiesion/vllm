@@ -218,8 +218,15 @@ class Gemma4Config(VerifyAndUpdateConfig):
 
         from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        from vllm.platforms import current_platform
 
         max_head_dim = max(head_dim, global_head_dim)
+
+        if current_platform.is_xpu():
+            # XPU FlashAttention routes 512-dim full-attention layers through
+            # its varlen implementation, while the 256-dim sliding layers can
+            # use the native paged decode path.
+            return
 
         if is_fa_version_supported(4) and max_head_dim <= 512:
             if (

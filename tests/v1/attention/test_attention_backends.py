@@ -3,6 +3,8 @@
 """Tests for v1 attention backends without GPUModelRunner dependency."""
 
 from functools import partial
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -29,6 +31,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends import flash_attn as flash_attn_backend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import (
     set_kv_cache_layout,
@@ -50,6 +53,37 @@ try:
     import flashinfer  # noqa: F401
 except ImportError:
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER)
+
+
+def test_flash_attn_draft_metadata_reuse_is_xpu_only(monkeypatch):
+    builder = object.__new__(flash_attn_backend.FlashAttentionMetadataBuilder)
+    cached_metadata = SimpleNamespace()
+    rebuilt_metadata = SimpleNamespace()
+    builder._draft_metadata = cached_metadata
+    builder.build = Mock(return_value=rebuilt_metadata)
+    common_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        max_query_len=1,
+        query_start_loc=object(),
+        max_seq_len=1,
+        seq_lens=object(),
+        block_table_tensor=object(),
+        slot_mapping=object(),
+        causal=True,
+    )
+
+    monkeypatch.setattr(flash_attn_backend.current_platform, "is_xpu", lambda: False)
+    assert builder.build_for_drafting(common_metadata, 1) is rebuilt_metadata
+    builder.build.assert_called_once_with(
+        common_prefix_len=0,
+        common_attn_metadata=common_metadata,
+        fast_build=True,
+    )
+
+    monkeypatch.setattr(flash_attn_backend.current_platform, "is_xpu", lambda: True)
+    builder.build.reset_mock()
+    assert builder.build_for_drafting(common_metadata, 1) is cached_metadata
+    builder.build.assert_not_called()
 
 
 def _convert_dtype_to_torch(dtype):

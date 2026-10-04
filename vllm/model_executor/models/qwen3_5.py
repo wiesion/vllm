@@ -195,6 +195,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
+        self._init_esimd_moe_norm(vllm_config)
 
 
 @support_torch_compile(
@@ -404,6 +405,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
+
+    hf_to_vllm_mapper = Qwen3VLForConditionalGeneration.hf_to_vllm_mapper | (
+        WeightsMapper(
+            orig_to_new_prefix={
+                "model.": "language_model.model.",
+            }
+        )
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__

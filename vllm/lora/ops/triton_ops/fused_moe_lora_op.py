@@ -872,6 +872,20 @@ def _get_ptr(lora_weights: list[torch.Tensor], device: torch.device):
     return _LORA_PTR_DICT.get(key)
 
 
+def _get_xpu_direct_weight(lora_weights: list[torch.Tensor]) -> torch.Tensor:
+    """Validate adjacent slice storage and return its directly addressable base."""
+    base = lora_weights[0]
+    slice_bytes = base.numel() * base.element_size()
+    for index, weight in enumerate(lora_weights):
+        assert weight.is_contiguous() and weight.shape == base.shape, (
+            "XPU fused MoE LoRA requires equal contiguous slice tensors"
+        )
+        assert weight.data_ptr() == base.data_ptr() + index * slice_bytes, (
+            "XPU fused MoE LoRA slices must share adjacent storage"
+        )
+    return base
+
+
 def _adjust_kernel_inputs(
     num_active_loras: torch.Tensor,  # CPU tensor [1], number of active LoRAs
     sorted_token_ids: torch.Tensor | None,
@@ -898,6 +912,7 @@ def _adjust_kernel_inputs(
         "stride_tl",
         "stride_el",
         "slice_a_size",
+        "slice_b_size",
         "slice_c_size",
     ]
 )
@@ -912,6 +927,8 @@ def _fused_moe_lora_kernel(
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
     token_lora_mapping_ptr,
+    a_row_mapping_ptr,
+    c_row_mapping_ptr,
     # Matrix dimensions
     N,
     K,
@@ -937,6 +954,7 @@ def _fused_moe_lora_kernel(
     stride_tl,
     stride_el,
     slice_a_size,
+    slice_b_size,
     slice_c_size,
     # Meta-parameters
     num_slice_a: tl.constexpr,
@@ -957,6 +975,9 @@ def _fused_moe_lora_kernel(
     USE_GDC: tl.constexpr,
     launch_pdl: tl.constexpr,
     IS_PRIMARY: tl.constexpr,
+    DIRECT_B_PTR: tl.constexpr,
+    MAP_A_ROWS: tl.constexpr,
+    MAP_C_ROWS: tl.constexpr,
     USE_TMA: tl.constexpr,
     # sort_c determines whether tokens are stored in C in the order determined
     # by sorted_token_ids to enable later TMA loads from this tensor.
@@ -1037,9 +1058,28 @@ def _fused_moe_lora_kernel(
         naive_block_assignment,
         BLOCK_SIZE_M,
     )
+    mapped_a_token = offs_token
+    if MAP_A_ROWS:
+        mapped_a_token = tl.load(
+            a_row_mapping_ptr + offs_token,
+            mask=offs_token < num_valid_tokens,
+            other=0,
+        )
+    mapped_c_token = offs_token
+    if MAP_C_ROWS:
+        mapped_c_token = tl.load(
+            c_row_mapping_ptr + offs_token,
+            mask=offs_token < num_valid_tokens,
+            other=0,
+        )
     # get a_ptr,b_ptr,c_ptr
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
-    cur_b_ptr = tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
+    if DIRECT_B_PTR:
+        cur_b_ptr = b_ptr + slice_id * slice_b_size
+    else:
+        cur_b_ptr = tl.load(b_ptr + slice_id).to(
+            tl.pointer_type(c_ptr.dtype.element_ty)
+        )
     cur_c_ptr = c_ptr + (slice_id % num_slice_c) * slice_c_size
 
     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
@@ -1058,7 +1098,7 @@ def _fused_moe_lora_kernel(
         # 'sorted_token_ids_ptr' then store them in c_ptr in this same sorted order
         tl.static_assert(a_desc is None, "a_desc must be none")
         a_ptrs = cur_a_ptr + (
-            offs_token[:, None] // token_mapping_factor * stride_am
+            mapped_a_token[:, None] // token_mapping_factor * stride_am
             + offs_k[None, :] * stride_ak
         )
 
@@ -1142,7 +1182,7 @@ def _fused_moe_lora_kernel(
         lora_id,
         pid_m,
         offs,
-        offs_token,
+        mapped_c_token,
         offs_cn,
         stride_cm,
         stride_cn,
@@ -1198,6 +1238,7 @@ def _fused_moe_lora_shrink(
     mul_routed_weight: bool = False,
     use_gdc: bool = False,
     use_tma: bool = False,
+    a_row_mapping: torch.Tensor | None = None,
 ) -> None:
     w1_lora_a_stacked = lora_a_stacked[0]
     shrink_config = {
@@ -1213,7 +1254,12 @@ def _fused_moe_lora_shrink(
         "USE_TMA": use_tma,
     }
 
-    b_ptr = _get_ptr(lora_a_stacked, device)
+    direct_b_ptr = current_platform.is_xpu()
+    b_ptr = (
+        _get_xpu_direct_weight(lora_a_stacked)
+        if direct_b_ptr
+        else _get_ptr(lora_a_stacked, device)
+    )
 
     grid_lora_dim, stride_tl, stride_el = _adjust_kernel_inputs(
         num_active_loras, sorted_token_ids, expert_ids
@@ -1245,6 +1291,8 @@ def _fused_moe_lora_shrink(
         expert_ids,
         num_tokens_post_padded,
         token_lora_mapping,
+        a_row_mapping,
+        None,
         N,
         K,
         EM,
@@ -1265,16 +1313,24 @@ def _fused_moe_lora_shrink(
         stride_tl,
         stride_el,
         slice_a_size=qcurr_hidden_states.numel(),
+        slice_b_size=lora_a_stacked[0].numel(),
         slice_c_size=a_intermediate_cache1.numel() // num_slices,
         num_slice_a=1,
         num_slice_c=num_slices,
-        token_mapping_factor=1 if mul_routed_weight else top_k_num,
+        # A route-row mapping already resolves each flattened route to an
+        # expanded input row. Only divide by top-k when A is still token-major.
+        token_mapping_factor=(
+            1 if mul_routed_weight or a_row_mapping is not None else top_k_num
+        ),
         naive_block_assignment=sorted_token_ids is None,
         MUL_ROUTED_WEIGHT=False,
         ADD_INPUTS=False,
         USE_B_L2_CACHE=True,
         sort_c=use_tma and sorted_token_ids is not None,
         IS_PRIMARY=True,
+        DIRECT_B_PTR=direct_b_ptr,
+        MAP_A_ROWS=a_row_mapping is not None,
+        MAP_C_ROWS=False,
         **shrink_config,
     )
 
@@ -1317,8 +1373,15 @@ def _fused_moe_lora_expand(
     offset: int = 0,
     use_gdc: bool = False,
     use_tma: bool = False,
+    c_row_mapping: torch.Tensor | None = None,
+    add_inputs: bool = True,
 ) -> None:
-    b_ptr = _get_ptr(lora_b_stacked, device)
+    direct_b_ptr = current_platform.is_xpu()
+    b_ptr = (
+        _get_xpu_direct_weight(lora_b_stacked)
+        if direct_b_ptr
+        else _get_ptr(lora_b_stacked, device)
+    )
     K = max_lora_rank
     N = w1_output_dim_size
 
@@ -1381,6 +1444,8 @@ def _fused_moe_lora_expand(
         expert_ids,
         num_tokens_post_padded,
         token_lora_mapping,
+        None,
+        c_row_mapping,
         N,
         K,
         EM,
@@ -1401,16 +1466,20 @@ def _fused_moe_lora_expand(
         stride_tl,
         stride_el,
         slice_a_size=a_intermediate_cache1.numel() // num_slices,
+        slice_b_size=lora_b_stacked[0].numel(),
         slice_c_size=slice_c_size,
         num_slice_a=num_slices,
         num_slice_c=num_slices,
         token_mapping_factor=1,
         naive_block_assignment=sorted_token_ids is None,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
-        ADD_INPUTS=True,
+        ADD_INPUTS=add_inputs,
         USE_B_L2_CACHE=True,
         sort_c=False,
         IS_PRIMARY=False,
+        DIRECT_B_PTR=direct_b_ptr,
+        MAP_A_ROWS=False,
+        MAP_C_ROWS=c_row_mapping is not None,
         **expand_config,
     )
 
@@ -1453,6 +1522,8 @@ def _fused_moe_lora(
     fully_sharded: bool = False,
     offset: int = 0,
     add_inputs: bool = True,
+    a_row_mapping: torch.Tensor | None = None,
+    c_row_mapping: torch.Tensor | None = None,
 ) -> None:
     assert len(lora_a_stacked) == len(lora_b_stacked) > 0
     assert topk_weights.dim() == qcurr_hidden_states.dim() == 2
@@ -1475,9 +1546,13 @@ def _fused_moe_lora(
         )
     assert output.shape[0] == topk_weights.shape[0]
     assert top_k_num == topk_weights.shape[1]
+    if a_row_mapping is not None:
+        assert a_row_mapping.numel() == topk_weights.numel()
+    if c_row_mapping is not None:
+        assert c_row_mapping.numel() == topk_weights.numel()
 
     # Fast path: single fused kernel
-    if not fully_sharded:
+    if not fully_sharded and not current_platform.is_xpu():
         M_pairs = topk_weights.numel()
         if (
             sorted_token_ids is None
@@ -1523,9 +1598,9 @@ def _fused_moe_lora(
         )
         return
 
-    assert add_inputs, (
-        "fused_moe_lora(add_inputs=False) is only supported on the "
-        "fully_sharded=False fast path"
+    assert add_inputs or (current_platform.is_xpu() and not fully_sharded), (
+        "fused_moe_lora(add_inputs=False) is supported only by the "
+        "non-fully-sharded XPU two-pass path"
     )
 
     device = qcurr_hidden_states.device
@@ -1609,6 +1684,7 @@ def _fused_moe_lora(
         mul_routed_weight,
         use_gdc=use_gdc,
         use_tma=use_tma,
+        a_row_mapping=a_row_mapping,
     )
 
     if fully_sharded:
@@ -1659,6 +1735,8 @@ def _fused_moe_lora(
         offset,
         use_gdc=use_gdc,
         use_tma=use_tma,
+        c_row_mapping=c_row_mapping,
+        add_inputs=add_inputs,
     )
 
 
@@ -1695,6 +1773,8 @@ def _fused_moe_lora_fake(
     fully_sharded: bool = False,
     offset: int = 0,
     add_inputs: bool = True,
+    a_row_mapping: torch.Tensor | None = None,
+    c_row_mapping: torch.Tensor | None = None,
 ) -> None:
     return
 
@@ -1730,6 +1810,7 @@ def _fused_moe_lora_shrink_fake(
     mul_routed_weight: bool = False,
     use_gdc: bool = False,
     use_tma: bool = False,
+    a_row_mapping: torch.Tensor | None = None,
 ) -> None:
     return
 
@@ -1768,6 +1849,8 @@ def _fused_moe_lora_expand_fake(
     offset: int = 0,
     use_gdc: bool = False,
     use_tma: bool = False,
+    c_row_mapping: torch.Tensor | None = None,
+    add_inputs: bool = True,
 ) -> None:
     return
 

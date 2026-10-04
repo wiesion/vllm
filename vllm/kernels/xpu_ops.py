@@ -18,8 +18,19 @@ def is_xpu_kernels_found() -> bool:
 XPU_KERNELS_SUPPORTED = is_xpu_kernels_found()
 """Kernels in this file are supported if vLLM XPU kernels are installed."""
 
-rms_no_var = lambda x, weight, epsilon, variance_size=None: variance_size is None and (
-    weight is None or weight.dtype == x.dtype
+
+def _supports_rms_weight(x: Tensor, weight: Tensor | None) -> bool:
+    return (
+        weight is None
+        or weight.dtype == x.dtype
+        or (
+            x.dtype in (torch.float16, torch.bfloat16) and weight.dtype == torch.float32
+        )
+    )
+
+
+rms_no_var = lambda x, weight, epsilon, variance_size=None: (
+    variance_size is None and _supports_rms_weight(x, weight)
 )
 
 
@@ -40,7 +51,8 @@ def rms_norm(
 
 rms_add_no_var_size = (
     lambda x, x_residual, weight, epsilon, variance_size=None: variance_size is None
-    and (weight is None or weight.dtype == x.dtype)
+    and x_residual.dtype == x.dtype
+    and _supports_rms_weight(x, weight)
 )
 
 

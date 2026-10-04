@@ -27,6 +27,8 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         lora_config: LoRAConfig,
         model_config: PretrainedConfig | None = None,
     ) -> None:
+        self.adapter_enabled_cpu = [False] * max_loras
+        self.adapter_ranks_cpu = [0] * max_loras
         if self.base_layer.num_added_embeddings_per_partition > 0:
             # We can start adding lora weights
             self.embeddings_weights = self.base_layer.weight.data[
@@ -73,6 +75,8 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     def reset_lora(self, index: int):
         self.lora_a_stacked[index] = 0
         self.lora_b_stacked[index] = 0
+        self.adapter_enabled_cpu[index] = False
+        self.adapter_ranks_cpu[index] = 0
 
     def set_lora(
         self,
@@ -92,8 +96,13 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.lora_b_stacked[index, 0, : lora_b.shape[0], : lora_b.shape[1]].copy_(
             lora_b, non_blocking=True
         )
+        self.adapter_enabled_cpu[index] = True
+        self.adapter_ranks_cpu[index] = lora_a.shape[0]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.is_lora_active():
+            return self.base_layer.forward(x)
+
         # NB: Don't use torch.narrow here. torch.narrow triggers some
         # Dynamic Shape specialization in torch.compile
         num_tokens = x.shape[0]

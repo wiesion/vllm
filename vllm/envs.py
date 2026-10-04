@@ -291,6 +291,14 @@ if TYPE_CHECKING:
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_SYM_INT4_WEIGHT_QUANT_BACKEND: Literal["cpu", "xpu_esimd"] = "xpu_esimd"
+    VLLM_QUANTIZE_Q40_LIB: str = os.path.join(
+        sys.prefix,
+        "lib",
+        f"python{sys.version_info.major}.{sys.version_info.minor}",
+        "site-packages",
+        "vllm_int4_for_multi_arc.so",
+    )
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -1997,6 +2005,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
+    ),
+    # Backend for runtime BF16/FP16 -> GGML Q4_0 weight quantization.
+    "VLLM_SYM_INT4_WEIGHT_QUANT_BACKEND": env_with_choices(
+        "VLLM_SYM_INT4_WEIGHT_QUANT_BACKEND",
+        "xpu_esimd",
+        ["cpu", "xpu_esimd"],
+    ),
+    # CPU fallback library for runtime BF16/FP16 -> GGML Q4_0 quantization.
+    # Used by the cpu backend and as a fallback when xpu_esimd is unavailable.
+    "VLLM_QUANTIZE_Q40_LIB": lambda: os.getenv(
+        "VLLM_QUANTIZE_Q40_LIB",
+        os.path.join(
+            sys.prefix,
+            "lib",
+            f"python{sys.version_info.major}.{sys.version_info.minor}",
+            "site-packages",
+            "vllm_int4_for_multi_arc.so",
+        ),
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(

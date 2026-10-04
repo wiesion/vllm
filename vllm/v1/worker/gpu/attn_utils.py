@@ -21,6 +21,10 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    GDNAttentionMetadataBuilder,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -592,6 +596,7 @@ def build_attn_metadata(
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    reusable_gdn_metadata: dict[MambaSpec, GDNAttentionMetadata] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
@@ -646,11 +651,36 @@ def build_attn_metadata(
                     if model_specific_attn_metadata is not None
                     else {}
                 )
-                metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
-                    **attn_metadata_extra_kwargs,
-                )
+                metadata = None
+                if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
+                    cached_metadata = reusable_gdn_metadata.get(
+                        attn_metadata_builder.kv_cache_spec
+                    )
+                    if cached_metadata is not None:
+                        metadata = (
+                            attn_metadata_builder.rebind_pure_spec_decode_metadata(
+                                cached_metadata,
+                                common_attn_metadata,
+                            )
+                        )
+                if metadata is None:
+                    metadata = attn_metadata_builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=common_attn_metadata,
+                        **attn_metadata_extra_kwargs,
+                    )
+                    if (
+                        isinstance(
+                            attn_metadata_builder, GDNAttentionMetadataBuilder
+                        )
+                        and attn_metadata_builder.can_reuse_pure_spec_decode_metadata(
+                            metadata,
+                            common_attn_metadata,
+                        )
+                    ):
+                        reusable_gdn_metadata[attn_metadata_builder.kv_cache_spec] = (
+                            metadata
+                        )
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

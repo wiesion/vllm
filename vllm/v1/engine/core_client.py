@@ -728,10 +728,12 @@ class MPClient(EngineCoreClient):
         num_gpu_blocks += response.num_gpu_blocks
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
 
-        # Sync block_size: may be enlarged by _align_hybrid_block_size in the
-        # worker for hybrid Mamba models.
+        # Sync block sizes: they may be enlarged in the worker for hybrid
+        # Mamba models.
         cache_config = vllm_config.cache_config
         cache_config.block_size = response.block_size
+        if response.mamba_block_size is not None:
+            cache_config.mamba_block_size = response.mamba_block_size
         # Keep these as per-engine cache_config_info values; do not sum across DP.
         cache_config.kv_cache_size_tokens = (
             getattr(cache_config, "kv_cache_size_tokens", None)

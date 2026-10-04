@@ -90,6 +90,8 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
         # TODO: Verify if this condition can be further relaxed
         if self.base_layer.vocab_size > 258048:
             raise ValueError("When using LoRA, vocab size must be <= 258048")
+        self.adapter_enabled_cpu = [False] * max_loras
+        self.adapter_ranks_cpu = [0] * max_loras
         self.lora_a_stacked = torch.zeros(
             (
                 max_loras,
@@ -121,6 +123,8 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
     def reset_lora(self, index: int):
         self.lora_a_stacked[index] = 0
         self.lora_b_stacked[index] = 0
+        self.adapter_enabled_cpu[index] = False
+        self.adapter_ranks_cpu[index] = 0
 
     def set_lora(
         self,
@@ -137,6 +141,8 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
         self.lora_b_stacked[index, 0, : lora_b.shape[0], : lora_b.shape[1]].copy_(
             lora_b, non_blocking=True
         )
+        self.adapter_enabled_cpu[index] = True
+        self.adapter_ranks_cpu[index] = lora_a.shape[0]
 
     def _get_logits(
         self,
@@ -183,7 +189,12 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
             logits = logits[:, self.sharded_to_full_mapping_gpu]
 
         lora_output: torch.Tensor | None = self.punica_wrapper.add_lora_logits(
-            logits, hidden_states, self.lora_a_stacked, self.lora_b_stacked, 1.0
+            logits,
+            hidden_states,
+            self.lora_a_stacked,
+            self.lora_b_stacked,
+            1.0,
+            adapter_enabled_cpu=self.adapter_enabled_cpu,
         )
 
         if not current_platform.can_update_inplace():

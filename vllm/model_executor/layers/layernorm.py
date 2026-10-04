@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom normalization layers."""
 
+import importlib
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +17,12 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
 
 logger = init_logger(__name__)
+_DISABLE_ESIMD_NORM = os.environ.get("VLLM_XPU_DISABLE_ESIMD_NORM", "0") == "1"
+_ESIMD_NORM_MAX_M = 128
+
+
+def _is_xpu_tensor(value: object) -> bool:
+    return isinstance(value, torch.Tensor) and value.device.type == "xpu"
 
 
 def poly_norm(
@@ -157,13 +166,55 @@ class GemmaRMSNorm(CustomOp):
         weight = self.weight.float() + 1.0
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
-        return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm.maybe_inplace(
+            x, residual, weight, self.variance_epsilon
+        )
 
     def forward_cuda(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(x, residual)
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not _DISABLE_ESIMD_NORM
+            and residual is not None
+            and not getattr(torch.compiler, "is_compiling", lambda: False)()
+            and x.ndim == 2
+            and 1 <= x.shape[0] <= _ESIMD_NORM_MAX_M
+            and x.shape == residual.shape
+            and x.dtype == torch.float16
+            and residual.dtype == torch.float16
+            and _is_xpu_tensor(x)
+            and _is_xpu_tensor(residual)
+            and residual.device == x.device
+            and x.is_contiguous()
+            and residual.is_contiguous()
+        ):
+            try:
+                op = importlib.import_module(
+                    "custom_esimd_kernels_vllm"
+                ).esimd_fused_add_rms_norm_batched
+            except (AttributeError, ImportError, OSError):
+                pass
+            else:
+                weight = getattr(self, "_esimd_weight_fp16", None)
+                if weight is None or weight.device != x.device:
+                    weight = (
+                        (self.weight.data + 1.0)
+                        .to(device=x.device, dtype=torch.float16)
+                        .clone()
+                        .contiguous()
+                    )
+                    self._esimd_weight_fp16 = weight
+                op(x, residual, weight, self.variance_epsilon)
+                return x, residual
         return self.forward_native(x, residual)
 
 

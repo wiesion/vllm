@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -12,6 +13,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.model_executor.layers.esimd_utils import load_esimd_library
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
@@ -34,6 +36,7 @@ from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
     get_kv_cache_layout,
     get_num_attention_heads_from_layers,
+    is_valid_esimd_page_attention_input,
 )
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
@@ -577,6 +580,23 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.use_td = td_override
 
+        self._esimd_page_attn_checked = False
+        self._esimd_page_attn_op = None
+
+    def _get_esimd_page_attn_op(self):
+        if self._esimd_page_attn_checked:
+            return self._esimd_page_attn_op
+
+        self._esimd_page_attn_checked = True
+        try:
+            load_esimd_library("eagle_ops")
+            self._esimd_page_attn_op = (
+                torch.ops.eagle_ops.page_attn_decode_separate
+            )
+        except (AttributeError, ImportError, OSError):
+            self._esimd_page_attn_op = None
+        return self._esimd_page_attn_op
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -687,6 +707,73 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+
+        page_attn_op = self._get_esimd_page_attn_op()
+        if (
+            page_attn_op is not None
+            and os.environ.get("DISABLE_ESIMD_PAGE_ATTN") != "1"
+            and current_platform.is_xpu()
+            and not self._is_per_token_head_quant
+            and self.attn_type == AttentionType.DECODER
+            and attn_metadata.max_query_len == 1
+            and query[:num_actual_tokens].shape[0] == attn_metadata.seq_lens.shape[0]
+            and self.head_size == 256
+            and self.num_queries_per_kv >= 2
+            and self.sliding_window[0] == -1
+            and self.logits_soft_cap == 0
+            and self.sinks is None
+            and self.alibi_slopes is None
+            and mm_prefix_range_tensor is None
+            and attn_metadata.rswa_prefix_lens is None
+            and attn_metadata.causal is True
+            and output_scale is None
+            and is_valid_esimd_page_attention_input(
+                query[:num_actual_tokens],
+                output[:num_actual_tokens],
+                key_cache,
+                value_cache,
+            )
+            and key_cache.shape[3] == self.head_size
+        ):
+            num_q_heads = query.shape[1]
+            num_kv_heads = key_cache.shape[2]
+            gqa_ratio = (
+                num_q_heads // num_kv_heads if num_kv_heads > 0 else 0
+            )
+            if (
+                num_kv_heads > 0
+                and gqa_ratio * num_kv_heads == num_q_heads
+                and (gqa_ratio == 2 or gqa_ratio >= 4 and gqa_ratio % 4 == 0)
+            ):
+                page_query = query[:num_actual_tokens]
+                kernel_scale = 1.0 / (self.head_size**0.5)
+                if abs(self.scale - kernel_scale) > 1e-6:
+                    page_query = (
+                        page_query * (self.scale / kernel_scale)
+                    ).half()
+                k_scale = (
+                    float(layer._k_scale)
+                    if is_quantized_kv_cache(self.kv_cache_dtype)
+                    else 1.0
+                )
+                v_scale = (
+                    float(layer._v_scale)
+                    if is_quantized_kv_cache(self.kv_cache_dtype)
+                    else 1.0
+                )
+                page_attn_op(
+                    page_query,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seqused_k,
+                    output[:num_actual_tokens],
+                    1,
+                    max_seqlen_k,
+                    k_scale,
+                    v_scale,
+                )
+                return output
 
         unified_attention(
             q=query[:num_actual_tokens],

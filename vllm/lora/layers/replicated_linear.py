@@ -34,6 +34,9 @@ class ReplicatedLinearWithLoRA(BaseLinearLayerWithLoRA):
             - output
             - bias
         """
+        if not self.is_lora_active():
+            return self.base_layer.forward(input_)
+
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
 
         # Matrix multiply.

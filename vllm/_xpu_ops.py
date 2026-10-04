@@ -94,6 +94,32 @@ if hasattr(torch.ops._xpu_C, "int4_gemm_w4a16"):
         return torch.empty((M, N), dtype=input.dtype, device=input.device)
 
 
+def _prepare_xpu_gdn_index_tensors(
+    attn_metadata,
+) -> dict[str, torch.Tensor | None]:
+    """Normalize the index metadata required by the native XPU GDN op."""
+
+    def as_contiguous_int32(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        if tensor.dtype != torch.int32:
+            tensor = tensor.to(torch.int32)
+        return tensor.contiguous()
+
+    names = (
+        "num_accepted_tokens",
+        "non_spec_query_start_loc",
+        "non_spec_token_indx",
+        "non_spec_state_indices_tensor",
+        "spec_query_start_loc",
+        "spec_token_indx",
+        "spec_state_indices_tensor",
+    )
+    return {
+        name: as_contiguous_int32(getattr(attn_metadata, name)) for name in names
+    }
+
+
 def _gdn_attention_core_xpu_impl(
     core_attn_out: torch.Tensor,
     z: torch.Tensor,
@@ -117,33 +143,13 @@ def _gdn_attention_core_xpu_impl(
     assert isinstance(attn_metadata, GDNAttentionMetadata)
 
     num_actual_tokens = attn_metadata.num_actual_tokens
-    num_accepted_tokens = attn_metadata.num_accepted_tokens
-
     num_prefills = attn_metadata.num_prefills
     num_decodes = attn_metadata.num_decodes
     num_spec_decodes = attn_metadata.num_spec_decodes
 
     has_initial_state = attn_metadata.has_initial_state
 
-    non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-    non_spec_token_indx = attn_metadata.non_spec_token_indx
-    non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
-    non_spec_state_indices_tensor = (
-        non_spec_state_indices_tensor.contiguous()
-        if non_spec_state_indices_tensor is not None
-        else None
-    )
-
-    spec_query_start_loc = attn_metadata.spec_query_start_loc
-    spec_token_indx = attn_metadata.spec_token_indx
-    spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
-
-    spec_sequence_masks = attn_metadata.spec_sequence_masks
-    if spec_sequence_masks is not None:
-        if non_spec_token_indx is not None:
-            non_spec_token_indx = non_spec_token_indx.to(torch.int32)
-        if spec_token_indx is not None:
-            spec_token_indx = spec_token_indx.to(torch.int32)
+    index_tensors = _prepare_xpu_gdn_index_tensors(attn_metadata)
 
     conv_weights = self.conv1d.weight.view(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
@@ -169,13 +175,15 @@ def _gdn_attention_core_xpu_impl(
         num_decodes=num_decodes,  # type: ignore[attr-defined]
         num_spec_decodes=num_spec_decodes,  # type: ignore[attr-defined]
         has_initial_state=has_initial_state,  # type: ignore[attr-defined]
-        non_spec_query_start_loc=non_spec_query_start_loc,  # type: ignore[attr-defined]
-        non_spec_token_indx=non_spec_token_indx,  # type: ignore[attr-defined]
-        non_spec_state_indices_tensor=non_spec_state_indices_tensor,  # type: ignore[attr-defined]
-        spec_query_start_loc=spec_query_start_loc,  # type: ignore[attr-defined]
-        spec_token_indx=spec_token_indx,  # type: ignore[attr-defined]
-        spec_state_indices_tensor=spec_state_indices_tensor,
-        num_accepted_tokens=num_accepted_tokens,  # type: ignore[attr-defined]
+        non_spec_query_start_loc=index_tensors["non_spec_query_start_loc"],
+        non_spec_token_indx=index_tensors["non_spec_token_indx"],
+        non_spec_state_indices_tensor=index_tensors[
+            "non_spec_state_indices_tensor"
+        ],
+        spec_query_start_loc=index_tensors["spec_query_start_loc"],
+        spec_token_indx=index_tensors["spec_token_indx"],
+        spec_state_indices_tensor=index_tensors["spec_state_indices_tensor"],
+        num_accepted_tokens=index_tensors["num_accepted_tokens"],
         num_actual_tokens=num_actual_tokens,  # type: ignore[attr-defined]
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
@@ -787,6 +795,10 @@ class xpu_ops:
         dynamic_causal: torch.Tensor | None = None,
         mask_mod: Callable | None = None,
         aux_tensors: list | None = None,
+        per_seq_causal: torch.Tensor | None = None,
+        num_splits_kv: int | None = None,
+        is_mix_batch: bool = True,
+        host_kv_lens: torch.Tensor | None = None,
         **kwargs,
     ):
         assert cu_seqlens_k is not None or seqused_k is not None, (
@@ -810,6 +822,16 @@ class xpu_ops:
             assert len(window_size) == 2
             real_window_size = (window_size[0], window_size[1])  # noqa: F841
 
+        # The upstream attention API calls the per-sequence mask
+        # ``dynamic_causal``. The XPU FA2 kernel exposes the same input as
+        # ``per_seq_causal``.
+        if dynamic_causal is not None:
+            if per_seq_causal is not None:
+                raise ValueError(
+                    "dynamic_causal and per_seq_causal cannot both be set"
+                )
+            per_seq_causal = dynamic_causal
+
         return flash_attn_varlen_func(
             out=out,
             q=q,
@@ -831,6 +853,13 @@ class xpu_ops:
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            scheduler_metadata=scheduler_metadata,
+            fa_version=fa_version,
+            num_splits=num_splits,
+            per_seq_causal=per_seq_causal,
+            num_splits_kv=num_splits_kv,
+            is_mix_batch=is_mix_batch,
+            host_kv_lens=host_kv_lens,
         )
 
     @staticmethod

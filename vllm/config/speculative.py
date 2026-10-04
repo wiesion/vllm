@@ -877,7 +877,11 @@ class SpeculativeConfig:
                     self.method = "eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
-                elif "dflash" in self.draft_model_config.model.lower():
+                elif (
+                    "dflash" in self.draft_model_config.model.lower()
+                    or "MuseGlimmerAssistantModel"
+                    in self.draft_model_config.architectures
+                ):
                     self.method = "dflash"
                 elif (
                     "dspark" in self.draft_model_config.model.lower()
@@ -1329,6 +1333,20 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_qwen_mtp_or_dflash(self) -> bool:
+        if self.method not in ("mtp", "dflash") or self.target_model_config is None:
+            return False
+        model_type = getattr(
+            self.target_model_config.hf_text_config, "model_type", None
+        )
+        return model_type in {
+            "qwen3_next",
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+        }
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"

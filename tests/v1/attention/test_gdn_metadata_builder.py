@@ -6,6 +6,7 @@ Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -134,10 +135,13 @@ def _create_gdn_builder(
     if full_cuda_graph:
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
     if num_speculative_tokens > 0:
-        vllm_config.speculative_config = SpeculativeConfig(
+        speculative_config = SpeculativeConfig(
             method="ngram",
             num_speculative_tokens=num_speculative_tokens,
         )
+        speculative_config.method = "mtp"
+        speculative_config.target_model_config = vllm_config.model_config
+        vllm_config.speculative_config = speculative_config
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE,
         shapes=((16, 64),),
@@ -221,3 +225,80 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_pure_spec_metadata_rebinds_only_state_indices():
+    builder = _create_gdn_builder(num_speculative_tokens=2)
+    batch = BatchSpec(seq_lens=[50, 30], query_lens=[3, 3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_decode_draft_tokens_cpu=torch.tensor([2, 2], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+    )
+
+    next_common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    next_common.block_table_tensor.fill_(7)
+    rebound = builder.rebind_pure_spec_decode_metadata(metadata, next_common)
+
+    assert rebound is not None
+    assert rebound is not metadata
+    assert rebound.spec_state_indices_tensor is not metadata.spec_state_indices_tensor
+    assert torch.all(rebound.spec_state_indices_tensor == 7)
+    assert rebound.spec_token_indx is metadata.spec_token_indx
+    assert rebound.spec_query_start_loc is metadata.spec_query_start_loc
+    assert rebound.num_accepted_tokens is metadata.num_accepted_tokens
+
+
+def test_mixed_spec_metadata_is_not_reused():
+    builder = _create_gdn_builder(num_speculative_tokens=2)
+    batch = BatchSpec(seq_lens=[65, 20], query_lens=[1, 3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_decode_draft_tokens_cpu=torch.tensor([-1, 2], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+    )
+
+    assert builder.rebind_pure_spec_decode_metadata(metadata, common) is None
+
+
+def test_other_speculative_methods_do_not_reuse_metadata():
+    builder = _create_gdn_builder(num_speculative_tokens=2)
+    assert builder.speculative_config is not None
+    builder.speculative_config.method = "ngram"
+    builder._reuse_qwen_spec_metadata = False
+    batch = BatchSpec(seq_lens=[50, 30], query_lens=[3, 3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_decode_draft_tokens_cpu=torch.tensor([2, 2], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+    )
+
+    assert builder.rebind_pure_spec_decode_metadata(metadata, common) is None
+
+
+def test_pure_spec_metadata_reuse_requires_qwen_mtp_or_dflash():
+    builder = object.__new__(GDNAttentionMetadataBuilder)
+    builder.use_full_cuda_graph = False
+    metadata = GDNAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=2,
+        num_spec_decode_tokens=6,
+        num_actual_tokens=6,
+        spec_sequence_masks=torch.ones(2, dtype=torch.bool),
+    )
+    common = SimpleNamespace(num_reqs=2, num_actual_tokens=6)
+
+    builder._reuse_qwen_spec_metadata = False
+    assert not builder.can_reuse_pure_spec_decode_metadata(metadata, common)
+
+    builder._reuse_qwen_spec_metadata = True
+    assert builder.can_reuse_pure_spec_decode_metadata(metadata, common)

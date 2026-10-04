@@ -570,6 +570,15 @@ class VllmConfig:
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
 
+        from vllm.platforms import current_platform
+
+        if (
+            current_platform.is_xpu()
+            and self.speculative_config is not None
+            and self.speculative_config.use_gemma4_mtp()
+        ):
+            return False
+
         if not self._is_default_v2_model_runner_model():
             return False
 

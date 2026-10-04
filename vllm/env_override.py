@@ -82,6 +82,10 @@ def _maybe_set_cuda_compatibility_path():
     os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(new_paths)
 
 
+# Torch 2.12's Flight Recorder adds measurable overhead to frequent small XCCL
+# collectives. Explicit user settings still take precedence.
+os.environ.setdefault("TORCH_FR_BUFFER_SIZE", "0")
+
 _maybe_set_cuda_compatibility_path()
 
 import torch

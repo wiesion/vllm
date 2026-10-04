@@ -48,6 +48,10 @@ class MoELoRAContext:
     # them to local_num_experts via a stride-0 view before the kernel.
     enable_moe_shared_loras: bool = False
 
+    # CPU mirror used to skip the staged MoE path when none of the adapters
+    # active in the current batch have expert weights for this layer.
+    adapter_enabled_cpu: list[bool] | None = None
+
     # Optional dual-stream support for overlapping each (base GEMM, LoRA)
     # pair. When aux_stream is None, the experts.apply() path runs the
     # original sequential schedule. When set, base GEMM runs on the default

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
@@ -95,6 +95,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.speculative_config = vllm_config.speculative_config
+        self._reuse_qwen_spec_metadata = (
+            self.speculative_config is not None
+            and self.speculative_config.use_qwen_mtp_or_dflash()
+        )
         self.kv_cache_spec = kv_cache_spec
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             _resolve_gdn_prefill_backend,
@@ -163,6 +167,47 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             (self.decode_cudagraph_max_bs,),
             dtype=torch.int32,
             device=device,
+        )
+
+    def can_reuse_pure_spec_decode_metadata(
+        self,
+        metadata: GDNAttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> bool:
+        return (
+            self._reuse_qwen_spec_metadata
+            and not self.use_full_cuda_graph
+            and metadata.num_prefills == 0
+            and metadata.num_decodes == 0
+            and metadata.num_spec_decodes == common_attn_metadata.num_reqs
+            and metadata.num_spec_decode_tokens
+            == common_attn_metadata.num_actual_tokens
+            and metadata.spec_sequence_masks is not None
+            and metadata.non_spec_state_indices_tensor is None
+        )
+
+    def rebind_pure_spec_decode_metadata(
+        self,
+        metadata: GDNAttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> GDNAttentionMetadata | None:
+        if not self.can_reuse_pure_spec_decode_metadata(
+            metadata, common_attn_metadata
+        ):
+            return None
+
+        block_table_tensor = mamba_get_block_table_tensor(
+            common_attn_metadata.block_table_tensor,
+            common_attn_metadata.seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        spec_state_indices_tensor = block_table_tensor[
+            : common_attn_metadata.num_reqs, : self.num_spec + 1
+        ]
+        return replace(
+            metadata,
+            spec_state_indices_tensor=spec_state_indices_tensor,
         )
 
     def build(  # type: ignore[override]

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
+    get_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_gather,
@@ -58,8 +59,14 @@ class LogitsProcessor(PluggableLayer):
         # Dtype of the lm_head projection. Defaults to the model dtype; an
         # fp32 head (via `--hf-overrides '{"head_dtype": "float32"}'`) is
         # required for RL training-inference consistency.
-        model_config = get_current_vllm_config().model_config
+        vllm_config = get_current_vllm_config()
+        model_config = vllm_config.model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        speculative_config = vllm_config.speculative_config
+        self._use_qwen_spec_xpu_local_argmax = (
+            speculative_config is not None
+            and speculative_config.use_qwen_mtp_or_dflash()
+        )
 
     def forward(
         self,
@@ -197,7 +204,31 @@ class LogitsProcessor(PluggableLayer):
             [local_max_vals.float(), global_indices.float()], dim=-1
         )
         # [batch, 2] -> [batch, 2 * tp_size]
-        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
+        if current_platform.is_xpu() and self._use_qwen_spec_xpu_local_argmax:
+            # Avoid the XPU eager-message path for this tiny payload.
+            group = get_tp_group()
+            gather_width = 64
+            gather_input = torch.zeros(
+                (*local_pair.shape[:-1], gather_width),
+                dtype=local_pair.dtype,
+                device=local_pair.device,
+            )
+            gather_input[..., :2].copy_(local_pair)
+            gathered_flat = torch.empty(
+                (tp_size * gather_input.shape[0], *gather_input.shape[1:]),
+                dtype=gather_input.dtype,
+                device=gather_input.device,
+            )
+            torch.distributed.all_gather_into_tensor(
+                gathered_flat, gather_input, group=group.device_group
+            )
+            gathered = (
+                gathered_flat.reshape(tp_size, *gather_input.shape)
+                .movedim(0, gather_input.dim() - 1)[..., :2]
+                .reshape(*local_pair.shape[:-1], tp_size * local_pair.shape[-1])
+            )
+        else:
+            gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
         # [batch, tp_size, 2] where [:, :, 0]=values, [:, :, 1]=indices
         gathered = gathered.view(hidden_states.shape[0], tp_size, 2)
         max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)

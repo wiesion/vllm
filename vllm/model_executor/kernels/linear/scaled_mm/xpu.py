@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
+from functools import cache
 
 import torch
 
+from vllm.logger import init_logger
+from vllm.model_executor.layers.esimd_utils import get_esimd_op
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
@@ -17,6 +21,129 @@ from vllm.platforms import current_platform
 
 from .BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
 from .ScaledMMLinearKernel import FP8ScaledMMLinearKernel, FP8ScaledMMLinearLayerConfig
+
+logger = init_logger(__name__)
+
+_ESIMD_FP8_MAX_M = 32
+_ESIMD_FP8_ALIGNMENT = 128
+# The BMG FP8 GEMV kernel supports the wider decode projections used by Gemma4.
+# Keep an override for shape-specific A/B runs and for disabling the path.
+_ESIMD_FP8_GEMV_MAX_N = int(os.environ.get("VLLM_XPU_FP8_GEMV_MAX_N", "32768"))
+_DISABLE_ESIMD_FP8 = os.environ.get("VLLM_XPU_DISABLE_FP8_ESIMD", "0") == "1"
+_DISABLE_ESIMD_FP8_BATCH = (
+    os.environ.get("VLLM_XPU_DISABLE_FP8_ESIMD_BATCH", "0") == "1"
+)
+
+# Qwen3.6-27B TP2 regions where ESIMD beat native fp8_gemm_w8a16 in the
+# synchronized microbenchmark. Untested or losing large shapes stay native.
+_ESIMD_FP8_BATCH_CAPABILITIES = {
+    (5120, 3072): frozenset({2, 4, 8, 12, 16, 32, 64}),
+}
+# Keep decode and small prefills on the existing W8A8 path. Across the Qwen3.6
+# 27B and 35B-A3B TP2 projection shapes, grouped W8A16 wins consistently from
+# M=128 while one shape still favors W8A8 at M=64.
+_XPU_BLOCK_W8A16_MIN_M = 128
+_XPU_BLOCK_ONEDNN_MIN_M = 8
+_XPU_BLOCK_QWEN36_27B_ONEDNN_MIN_M = 4
+_XPU_BLOCK_QWEN36_27B_SHAPES = {
+    (7168, 5120),
+    (5120, 3072),
+    (17408, 5120),
+    (5120, 8704),
+    (8192, 5120),
+}
+
+
+@cache
+def _load_esimd_op(is_decode: bool):
+    name = "esimd_gemv_fp8_pert" if is_decode else "esimd_gemm_fp8_pert"
+    return get_esimd_op(name)
+
+
+@cache
+def _load_esimd_block_op():
+    return get_esimd_op("esimd_gemm_fp8_blockscale")
+
+
+def _is_xpu_tensor(value: object) -> bool:
+    return isinstance(value, torch.Tensor) and value.device.type == "xpu"
+
+
+def _prepare_xpu_w8a16_weight(
+    weight: torch.Tensor, out_features: int, in_features: int
+) -> torch.Tensor:
+    """Store W8A16 weights as contiguous checkpoint-order ``[N, K]``."""
+    if weight.shape not in {(out_features, in_features), (in_features, out_features)}:
+        raise ValueError(
+            "XPU W8A16 FP8 expects weight shape "
+            f"({out_features}, {in_features}) or ({in_features}, {out_features}), "
+            f"got {tuple(weight.shape)}"
+        )
+    loader_transposed = weight.shape == (in_features, out_features) and (
+        in_features != out_features or not weight.is_contiguous()
+    )
+    return (weight.t() if loader_transposed else weight).contiguous()
+
+
+def _try_esimd_fp8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    allow_qwen_spec_n48: bool = False,
+) -> torch.Tensor | None:
+    """Use ESIMD FP8 GEMV/GEMM for decode and small/measured batches."""
+    if (
+        _DISABLE_ESIMD_FP8
+        or getattr(torch.compiler, "is_compiling", lambda: False)()
+        or bias is not None
+        or x.ndim != 2
+        or weight.ndim != 2
+        or not 1 <= x.shape[0] <= 64
+        or x.shape[1] != weight.shape[1]
+        or (
+            weight.shape[0] % _ESIMD_FP8_ALIGNMENT != 0
+            and not (allow_qwen_spec_n48 and weight.shape[0] == 48)
+        )
+        or weight.shape[1] % _ESIMD_FP8_ALIGNMENT != 0
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float8_e4m3fn
+        or weight_scale.dtype != torch.float32
+        or weight_scale.numel() != 1
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+        or not weight_scale.is_contiguous()
+        or not all(_is_xpu_tensor(t) for t in (x, weight, weight_scale))
+        or x.device != weight.device
+        or x.device != weight_scale.device
+    ):
+        return None
+
+    is_decode = x.shape[0] == 1 and weight.shape[0] <= _ESIMD_FP8_GEMV_MAX_N
+    if not is_decode:
+        if _DISABLE_ESIMD_FP8_BATCH:
+            return None
+        is_small_batch_gemm = 2 <= x.shape[0] <= _ESIMD_FP8_MAX_M
+        measured_region = x.shape[0] in _ESIMD_FP8_BATCH_CAPABILITIES.get(
+            (weight.shape[0], weight.shape[1]), ()
+        )
+        if not (is_small_batch_gemm or measured_region):
+            return None
+    try:
+        op = _load_esimd_op(is_decode)
+    except (AttributeError, ImportError, OSError):
+        return None
+
+    output = torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.float16, device=x.device
+    )
+    op(x, weight, weight_scale, output)
+    logger.info_once(
+        "XPU runtime-FP8 linear is using the ESIMD %s path.",
+        "GEMV" if is_decode else "GEMM",
+        scope="local",
+    )
+    return output
 
 
 class XPUW8A8FP8LinearKernel(FP8ScaledMMLinearKernel):
@@ -49,8 +176,10 @@ class XPUW8A8FP8LinearKernel(FP8ScaledMMLinearKernel):
         if c.activation_quant_key not in cls._SUPPORTED_ACT_QUANT_KEYS:
             return (
                 False,
-                "XPUW8A8FP8Linear only support per-tensor and per-token activation "
-                "quantization",
+                (
+                    "XPUW8A8FP8Linear only support per-tensor and per-token "
+                    "activation quantization"
+                ),
             )
         if c.weight_quant_key.dtype not in {torch.float8_e5m2, torch.float8_e4m3fn}:
             return False, "XPUW8A8FP8Linear only support FP8 weight dtype"
@@ -132,8 +261,10 @@ class XPUW8A16FP8LinearKernel(FP8ScaledMMLinearKernel):
         if c.weight_quant_key not in {kFp8StaticChannelSym, kFp8StaticTensorSym}:
             return (
                 False,
-                "XPUW8A16FP8Linear only support per-channel and per-tensor "
-                "quantization",
+                (
+                    "XPUW8A16FP8Linear only support per-channel and per-tensor "
+                    "quantization"
+                ),
             )
         if c.weight_quant_key.dtype not in {torch.float8_e5m2, torch.float8_e4m3fn}:
             return False, "XPUW8A16FP8Linear only support FP8 weight dtype"
@@ -148,18 +279,10 @@ class XPUW8A16FP8LinearKernel(FP8ScaledMMLinearKernel):
         self.layer_param_names = layer_param_names
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # fp8_gemm_w8a16 expects weight in [in, out] layout.
-        # Transpose if weight is still in [out, in] layout.
-        # For square matrices, use contiguity as tie-breaker:
-        # checkpoint weights are contiguous, .t() views are not.
         weight = layer.weight
         out_features, in_features = self.config.weight_shape
-
-        if weight.shape == (out_features, in_features) and (
-            in_features != out_features or weight.is_contiguous()
-        ):
-            replace_parameter(layer, "weight", weight.data.t())
-        # else: already in [in, out] layout — no-op
+        weight = _prepare_xpu_w8a16_weight(weight, out_features, in_features)
+        replace_parameter(layer, "weight", weight.data)
 
         weight_scale = layer.weight_scale.t().contiguous()
         replace_parameter(layer, "weight_scale", weight_scale.data)
@@ -172,7 +295,22 @@ class XPUW8A16FP8LinearKernel(FP8ScaledMMLinearKernel):
     ) -> torch.Tensor:
         weight = layer.weight
         weight_scale = layer.weight_scale
-        return torch.ops._xpu_C.fp8_gemm_w8a16(x, weight, weight_scale, bias)
+        if getattr(layer, "_force_native_fp8", False):
+            return torch.ops._xpu_C.fp8_gemm_w8a16(
+                x, weight.t(), weight_scale, bias
+            )
+        esimd_output = _try_esimd_fp8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias,
+            allow_qwen_spec_n48=getattr(
+                layer, "_allow_qwen_spec_esimd_fp8_n48", False
+            ),
+        )
+        if esimd_output is not None:
+            return esimd_output
+        return torch.ops._xpu_C.fp8_gemm_w8a16(x, weight.t(), weight_scale, bias)
 
     def apply_scaled_mm(
         self,
@@ -189,6 +327,10 @@ class XPUW8A16FP8LinearKernel(FP8ScaledMMLinearKernel):
 
 
 class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
+    # The optimized XPU paths consume the original fp16 activation and exact
+    # checkpoint 128x128 scales. Avoid the generic W8A8 input-quant step.
+    apply_input_quant = False
+
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
@@ -197,6 +339,34 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             return False, "XPUFp8BlockScaledMM only support on XPU"
         return True, None
 
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        params = self._get_layer_params(layer, **kwargs)
+        weight = params.weight
+        weight_scale = (
+            params.weight_scale
+            if params.weight_scale_inv is None
+            else params.weight_scale_inv
+        )
+        if weight_scale is None:
+            return super().apply_weights(layer, x, bias, **kwargs)
+        output = self.apply_block_scaled_mm(
+            A=x.view(-1, x.shape[-1]),
+            B=weight,
+            As=weight_scale,
+            Bs=weight_scale,
+        )
+        if bias is not None:
+            output = output + bias
+        return output.to(dtype=self.config.out_dtype).view(
+            *x.shape[:-1], weight.shape[0]
+        )
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
@@ -204,13 +374,66 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
-        # Weight is [N, K]. Use .t() to create a [K, N] view without copying.
-        # Bs is [N/128, K/128] — transpose to [K/128, N/128] for oneDNN.
-        return torch.ops._xpu_C.fp8_gemm(
-            A,
-            B.t(),
-            self.config.out_dtype,
-            As,
-            Bs.t().contiguous(),
-            torch.Tensor(),
+        block_n, block_k = map(int, self.weight_group_shape)
+        a16 = (
+            A
+            if A.dtype == torch.float16 and A.is_contiguous()
+            else A.to(torch.float16).contiguous()
         )
+        m = a16.shape[0]
+        n, k = B.shape
+        scale = (
+            Bs
+            if Bs.dtype == torch.float32 and Bs.is_contiguous()
+            else Bs.to(torch.float32).contiguous()
+        )
+        expected_scale_shape = (
+            (n + block_n - 1) // block_n,
+            (k + block_k - 1) // block_k,
+        )
+        if (
+            B.dtype != torch.float8_e4m3fn
+            or block_n != 128
+            or block_k != 128
+            or k % block_k != 0
+            or tuple(scale.shape) != expected_scale_shape
+        ):
+            return torch.ops._xpu_C.fp8_gemm(
+                A,
+                B.t(),
+                self.config.out_dtype,
+                As,
+                Bs.t().contiguous(),
+                torch.Tensor(),
+            )
+
+        use_onednn = m >= _XPU_BLOCK_ONEDNN_MIN_M or (
+            m >= _XPU_BLOCK_QWEN36_27B_ONEDNN_MIN_M
+            and (n, k) in _XPU_BLOCK_QWEN36_27B_SHAPES
+        )
+        if (
+            use_onednn
+            and n % block_n == 0
+            and hasattr(torch.ops._xpu_C, "fp8_gemm_w8a16")
+        ):
+            return torch.ops._xpu_C.fp8_gemm_w8a16(
+                a16,
+                B.t(),
+                scale.t().contiguous(),
+                None,
+            )
+
+        try:
+            op = _load_esimd_block_op()
+        except (AttributeError, ImportError, OSError):
+            return torch.ops._xpu_C.fp8_gemm(
+                A,
+                B.t(),
+                self.config.out_dtype,
+                As,
+                Bs.t().contiguous(),
+                torch.Tensor(),
+            )
+        output = torch.empty(m, n, dtype=torch.float16, device=a16.device)
+        op(a16, B, scale, output, block_n, block_k)
+        return output

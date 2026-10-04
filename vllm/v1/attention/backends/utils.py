@@ -46,6 +46,45 @@ PAD_SLOT_ID = -1
 NULL_BLOCK_ID = 0
 
 
+def is_valid_esimd_page_attention_input(
+    query: torch.Tensor,
+    output: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+) -> bool:
+    if (
+        query.dim() != 3
+        or output.dim() != 3
+        or key_cache.dim() != 4
+        or value_cache.dim() != 4
+    ):
+        return False
+    if query.dtype != torch.float16 or output.dtype != torch.float16:
+        return False
+    if output.shape != query.shape or key_cache.shape[3] != query.shape[2]:
+        return False
+    if key_cache.dtype not in (
+        torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        return False
+    if key_cache.dtype != value_cache.dtype:
+        return False
+    if key_cache.shape != value_cache.shape:
+        return False
+    if key_cache.stride() != value_cache.stride() or key_cache.stride(3) != 1:
+        return False
+    if (
+        query.device != output.device
+        or query.device != key_cache.device
+        or query.device != value_cache.device
+    ):
+        return False
+    page_size = key_cache.shape[1]
+    return 64 <= page_size <= 1024 and page_size & (page_size - 1) == 0
+
+
 def compute_mm_prefix_range_tensor(
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
     num_seqs: int,

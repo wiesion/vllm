@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -35,17 +36,27 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
     # --8<-- [end:modular_fused_moe]
 
     def __init__(
-        self, old_quant_method: FusedMoEMethodBase, moe_kernel: FusedMoEKernel
+        self,
+        old_quant_method: FusedMoEMethodBase,
+        moe_kernel: FusedMoEKernel,
+        use_modular_kernel: Callable[[], bool] | None = None,
     ):
         super().__init__(moe_kernel.moe_config)
         self.moe_quant_config = old_quant_method.moe_quant_config
         self.moe_kernel = moe_kernel
         self.old_quant_method = old_quant_method
+        self.use_modular_kernel = use_modular_kernel
         logger.debug("Swapping out %s", self.old_quant_method.__class__.__name__)
 
     @property
     def wraps_legacy_quant_method(self) -> bool:
         return not self.old_quant_method.supports_internal_mk
+
+    @property
+    def is_monolithic(self) -> bool:
+        if self.use_modular_kernel is None or self.use_modular_kernel():
+            return super().is_monolithic
+        return self.old_quant_method.is_monolithic
 
     @staticmethod
     def make(
@@ -115,4 +126,18 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             expert_map=layer.expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+        )
+
+    def apply_monolithic(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.old_quant_method.apply_monolithic(
+            layer=layer,
+            x=x,
+            router_logits=router_logits,
+            input_ids=input_ids,
         )

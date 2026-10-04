@@ -141,6 +141,9 @@ class ColumnParallelLinearWithLoRA(BaseLinearLayerWithLoRA):
             - output
             - bias
         """
+        if not self.is_lora_active():
+            return self.base_layer.forward(input_)
+
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
 
         # Matrix multiply.
@@ -215,6 +218,8 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         maintainability.
         """
         self.lora_config = lora_config
+        self.adapter_enabled_cpu = [False] * max_loras
+        self.adapter_ranks_cpu = [0] * max_loras
 
         lora_a_output_size_per_partition = (
             lora_config.max_lora_rank
@@ -265,38 +270,81 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def expand_packed_lora(
         self,
-        lora_a: list[torch.Tensor],
-        lora_b: list[torch.Tensor],
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        lora_a: list[torch.Tensor | None],
+        lora_b: list[torch.Tensor | None],
+    ) -> tuple[list[torch.Tensor | None], list[torch.Tensor | None]]:
         """
         Expand packed adapter groups when they don't match n_slices.
-        E.g. in_proj_qkv (covers Q+K+V) + in_proj_z
+        E.g. in_proj_qkv (covers Q+K+V) + in_proj_z.
+
+        A None group member means that member was not adapted; the slice(s)
+        it covers are emitted as None placeholders so subsequent groups stay
+        aligned and those slices are left at base weights. This matches the
+        None-tolerance already present in slice_lora_b() and the set_lora()
+        stacking loop.
         """
-        expanded_a: list[torch.Tensor] = []
-        expanded_b: list[torch.Tensor] = []
-        start_idx = 0
-        for a_i, b_i in zip(lora_a, lora_b):
-            # Determine which output slices this b_i covers.
-            b_rows, cu_rows, covered = b_i.shape[0], 0, 0
-            for i in range(start_idx, self.n_slices):
-                cu_rows += self.output_sizes[i]
-                if cu_rows == b_rows:
-                    covered = i - start_idx + 1
-                    break
+        if len(lora_a) != len(lora_b):
+            raise ValueError(
+                "Packed LoRA A/B group counts must match: "
+                f"{len(lora_a)} != {len(lora_b)}"
+            )
+
+        def find_group_coverages(group_idx: int, slice_idx: int) -> list[int] | None:
+            if group_idx == len(lora_b):
+                return [] if slice_idx == self.n_slices else None
+
+            remaining_groups = len(lora_b) - group_idx - 1
+            max_coverage = self.n_slices - slice_idx - remaining_groups
+            if max_coverage < 1:
+                return None
+
+            b_i = lora_b[group_idx]
+            if b_i is None:
+                candidates = range(1, max_coverage + 1)
             else:
-                raise ValueError(
-                    f"Cannot determine how to split lora_b with {b_rows} rows "
-                    f"into {self.n_slices} slices with output sizes "
-                    f"{self.output_sizes} starting from index {start_idx}."
-                )
+                rows = 0
+                candidates = []
+                for coverage in range(1, max_coverage + 1):
+                    rows += self.output_sizes[slice_idx + coverage - 1]
+                    if rows == b_i.shape[0]:
+                        candidates.append(coverage)
+                        break
+                    if rows > b_i.shape[0]:
+                        break
+
+            for coverage in candidates:
+                remaining = find_group_coverages(group_idx + 1, slice_idx + coverage)
+                if remaining is not None:
+                    return [coverage, *remaining]
+            return None
+
+        group_coverages = find_group_coverages(0, 0)
+        if group_coverages is None:
+            raise ValueError(
+                "Packed LoRA groups cannot be aligned with output slices: "
+                f"group rows={[None if b is None else b.shape[0] for b in lora_b]}, "
+                f"output sizes={self.output_sizes}"
+            )
+
+        expanded_a: list[torch.Tensor | None] = []
+        expanded_b: list[torch.Tensor | None] = []
+        start_idx = 0
+        for a_i, b_i, coverage in zip(lora_a, lora_b, group_coverages):
+            if b_i is None:
+                for _ in range(coverage):
+                    expanded_a.append(None)
+                    expanded_b.append(None)
+                start_idx += coverage
+                continue
+
             # Split b_i into per-slice tensors and replicate a_i for each.
             start = 0
-            for j in range(covered):
+            for j in range(coverage):
                 size = self.output_sizes[start_idx + j]
                 expanded_b.append(b_i[start : start + size, :])
                 expanded_a.append(a_i)
                 start += size
-            start_idx += covered
+            start_idx += coverage
         return expanded_a, expanded_b
 
     def set_lora(
@@ -326,6 +374,11 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 self.lora_b_stacked[i][
                     index, 0, : lora_b_i.shape[0], : lora_b_i.shape[1]
                 ].copy_(lora_b_i, non_blocking=True)
+        self.adapter_enabled_cpu[index] = True
+        ranks = {weight.shape[0] for weight in lora_a if weight is not None}
+        self.adapter_ranks_cpu[index] = (
+            ranks.pop() if len(ranks) == 1 else self.lora_config.max_lora_rank
+        )
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         merged_cls = maybe_get_oot_by_class(MergedColumnParallelLinear)

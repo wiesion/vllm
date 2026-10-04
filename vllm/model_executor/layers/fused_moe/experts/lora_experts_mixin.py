@@ -47,6 +47,7 @@ class LoRAExpertsMixin:
         top_k_num: int,
         add_inputs: bool = True,
         swap_w13_slices: bool = False,
+        c_row_mapping: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -92,6 +93,7 @@ class LoRAExpertsMixin:
             lora_context.use_tuned_config,
             add_inputs=add_inputs,
             token_lora_mapping=lora_context.local_token_lora_mapping,
+            c_row_mapping=c_row_mapping,
         )
 
     def apply_w2_lora(
@@ -110,6 +112,8 @@ class LoRAExpertsMixin:
         w2: torch.Tensor,
         top_k_num: int,
         add_inputs: bool = True,
+        row_mapping: torch.Tensor | None = None,
+        mul_routed_weight: bool = True,
     ) -> None:
         w2_lora_b_stacked = lora_context.w2_lora_b_stacked
         if lora_context.enable_moe_shared_loras:
@@ -140,4 +144,6 @@ class LoRAExpertsMixin:
             lora_context.tp_rank,
             lora_context.use_tuned_config,
             add_inputs=add_inputs,
+            row_mapping=row_mapping,
+            mul_routed_weight=mul_routed_weight,
         )

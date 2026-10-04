@@ -40,7 +40,10 @@ from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+from vllm.model_executor.models.gemma4 import (
+    GEMMA4_MOE_LORA_EXPERTS_PATTERN,
+    Gemma4ForCausalLM,
+)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.transformers.utils import recursive_replace_linear
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -978,6 +981,8 @@ class Gemma4ForConditionalGeneration(
     SupportsLoRA,
     SupportsEagle3,
 ):
+    is_3d_moe_weight = True
+
     # Gemma4 clamps mm_prefix bidirectional ranges to the sliding window
     # in-kernel (HF's (causal OR blockwise) AND sliding_window). The model
     # runner reads this to keep image bidirectional ranges that exceed the
@@ -999,6 +1004,9 @@ class Gemma4ForConditionalGeneration(
 
     # Maps checkpoint prefixes to vLLM module paths.
     hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_regex={
+            GEMMA4_MOE_LORA_EXPERTS_PATTERN: ".moe.experts",
+        },
         orig_to_new_prefix={
             # vision tower
             "model.vision_tower": "vision_tower",
@@ -1010,7 +1018,7 @@ class Gemma4ForConditionalGeneration(
             "model.language_model.": "language_model.model.",
             "lm_head.": "language_model.lm_head.",
             "model": "language_model.model",
-        }
+        },
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

@@ -52,6 +52,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -248,6 +249,39 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+_QWEN3_NEXT_PLAIN_MROPE = "_qwen3_next_plain_mrope"
+
+
+def _is_qwen3_next_plain_mrope_eligible(
+    *,
+    uses_mrope: bool,
+    cudagraph_mode: CUDAGraphMode,
+    num_tokens_unpadded: int,
+    num_tokens_padded: int,
+    is_speculative: bool,
+    allow_speculative: bool,
+    mrope_positions: np.ndarray | None,
+) -> bool:
+    """Whether the eager QKV path can treat this batch's MRoPE as plain RoPE."""
+    if (
+        not uses_mrope
+        or cudagraph_mode != CUDAGraphMode.NONE
+        or num_tokens_unpadded != num_tokens_padded
+        or not 1 <= num_tokens_unpadded <= 64
+        or (is_speculative and not allow_speculative)
+        or mrope_positions is None
+        or mrope_positions.ndim != 2
+        or mrope_positions.shape[0] != 3
+        or mrope_positions.shape[1] < num_tokens_unpadded
+    ):
+        return False
+
+    positions = mrope_positions[:, :num_tokens_unpadded]
+    return np.array_equal(positions[0], positions[1]) and np.array_equal(
+        positions[0], positions[2]
+    )
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -4360,6 +4394,18 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+        qwen3_next_plain_mrope = _is_qwen3_next_plain_mrope_eligible(
+            uses_mrope=self.uses_mrope,
+            cudagraph_mode=cudagraph_mode,
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+            is_speculative=self.speculative_config is not None,
+            allow_speculative=(
+                self.speculative_config is not None
+                and self.speculative_config.use_qwen_mtp_or_dflash()
+            ),
+            mrope_positions=(self.mrope_positions.np if self.uses_mrope else None),
+        )
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -4391,6 +4437,9 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            get_forward_context().additional_kwargs[_QWEN3_NEXT_PLAIN_MROPE] = (
+                qwen3_next_plain_mrope
+            )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

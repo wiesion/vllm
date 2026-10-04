@@ -53,6 +53,9 @@ class RowParallelLinearWithLoRA(BaseLinearLayerWithLoRA):
             - output
             - bias
         """
+        if not self.is_lora_active():
+            return self.base_layer.forward(input_)
+
         # set up backprop all-reduce.
         if self.base_layer.input_is_parallel:
             input_parallel = input_

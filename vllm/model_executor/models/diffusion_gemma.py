@@ -16,6 +16,7 @@ via Gemma4MultimodalEmbedder.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 from types import SimpleNamespace
 from typing import Any
@@ -65,6 +66,41 @@ from .interfaces import (
 )
 
 logger = init_logger(__name__)
+
+
+def _compile_if_supported(fn):
+    # XPU eager mode cannot launch the Inductor-generated Triton kernels used
+    # by these sampler helpers with TP and DiffusionGemma's large vocabulary.
+    return fn if current_platform.is_xpu() else torch.compile(fn, dynamic=True)
+
+
+def _sc_soft_embed(
+    probs: torch.Tensor,
+    embed_weight: torch.Tensor,
+    normalizer: torch.Tensor,
+    sc_vocab_start: int,
+    sc_vocab_end: int,
+    tp_size: int,
+    tp_group_name: str,
+) -> torch.Tensor:
+    probs_shard = probs[..., sc_vocab_start:sc_vocab_end]
+    if os.environ.get("DISABLE_DG_SAMPLER_OPT", "0") == "1":
+        embed_weight_fp32 = embed_weight.float()
+    else:
+        embed_weight_fp32 = getattr(embed_weight, "_dg_fp32", None)
+        if (
+            embed_weight_fp32 is None
+            or embed_weight_fp32.shape != embed_weight.shape
+        ):
+            embed_weight_fp32 = embed_weight.float()
+            embed_weight._dg_fp32 = embed_weight_fp32
+
+    soft_embeds = torch.matmul(probs_shard.float(), embed_weight_fp32)
+    if tp_size > 1:
+        soft_embeds = torch.ops.vllm.all_reduce(
+            soft_embeds, group_name=tp_group_name
+        )
+    return soft_embeds * normalizer.float()
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -124,7 +160,7 @@ class DiffusionGemmaProcessingInfo(Gemma4ProcessingInfo):
         return super().get_mm_max_tokens_per_item(seq_len, mm_counts)
 
 
-@torch.compile(dynamic=True)
+@_compile_if_supported
 def _softcap_logits(logits: torch.Tensor, cap: float) -> torch.Tensor:
     # fp32 before tanh for numerical stability (matches HF DiffusionGemma).
     # Compiling fuses the cast/div/tanh/mul into one elementwise kernel over
@@ -455,7 +491,7 @@ class DiffusionGemmaForConditionalGeneration(
         raise ValueError(f"Unsupported modality: {modality}")
 
 
-@torch.compile(dynamic=True)
+@_compile_if_supported
 def _compute_num_rejected(
     num_logits: torch.Tensor,
     num_sampled: torch.Tensor,
@@ -467,7 +503,7 @@ def _compute_num_rejected(
     return torch.where(is_denoise, query_lens, num_rejected)
 
 
-@torch.compile(dynamic=True)
+@_compile_if_supported
 def _compiled_sample_step(
     # Logits from the model [num_decode * CL, vocab]
     logits: torch.Tensor,
@@ -637,13 +673,28 @@ def _compiled_sample_step(
     # parallelism the embedding is vocab-sharded ([vocab/tp, hidden]) while
     # probs spans the full vocab, so each rank multiplies its local vocab slice
     # [sc_vocab_start, sc_vocab_end) and the partials are summed across ranks.
-    local_probs = probs[..., sc_vocab_start:sc_vocab_end].to(embed_weight.dtype)
-    soft_embeds = torch.matmul(
-        local_probs, embed_weight[: sc_vocab_end - sc_vocab_start]
-    )
-    if tp_size > 1:
-        soft_embeds = torch.ops.vllm.all_reduce(soft_embeds, group_name=tp_group_name)
-    soft_embeds = soft_embeds * normalizer
+    if current_platform.is_xpu():
+        soft_embeds = _sc_soft_embed(
+            probs,
+            embed_weight,
+            normalizer,
+            sc_vocab_start,
+            sc_vocab_end,
+            tp_size,
+            tp_group_name,
+        )
+    else:
+        local_probs = probs[..., sc_vocab_start:sc_vocab_end].to(
+            embed_weight.dtype
+        )
+        soft_embeds = torch.matmul(
+            local_probs, embed_weight[: sc_vocab_end - sc_vocab_start]
+        )
+        if tp_size > 1:
+            soft_embeds = torch.ops.vllm.all_reduce(
+                soft_embeds, group_name=tp_group_name
+            )
+        soft_embeds = soft_embeds * normalizer
     sc_embeds[decode_slots] = soft_embeds * sc_keep
 
     # Overwrite canvas with argmax for newly converged denoise requests

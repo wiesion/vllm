@@ -26,6 +26,14 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.mamba.gdn._xpu_esimd import (
+    try_esimd_gdn_core_decode,
+    try_esimd_gdn_core_spec_decode,
+    try_esimd_gdn_fp16_ba_projection,
+    try_esimd_gdn_input_projections,
+    try_esimd_gdn_output_norm_batched,
+    try_esimd_gdn_output_projection,
+)
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -37,6 +45,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization._sym_int4_esimd import (
+    try_esimd_int4_fused2_layers,
+)
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.inc import INCConfig
@@ -416,6 +427,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_v_heads=self.num_v_heads,
             quant_config=self.quant_config,
             prefix=f"{prefix}.in_proj_ba",
+        )
+        speculative_config = vllm_config.speculative_config
+        self.in_proj_ba._allow_qwen_spec_esimd_fp8_n48 = (
+            speculative_config is not None
+            and speculative_config.use_qwen_mtp_or_dflash()
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
 
@@ -901,30 +917,97 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        fused_projections = try_esimd_gdn_input_projections(
+            hidden_states, self.in_proj_qkvz, self.in_proj_ba
+        )
+        if fused_projections is None:
+            fused_projections = try_esimd_int4_fused2_layers(
+                hidden_states, self.in_proj_qkvz, self.in_proj_ba
+            )
+        if fused_projections is None:
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_ba = try_esimd_gdn_fp16_ba_projection(
+                hidden_states, self.in_proj_qkvz, self.in_proj_ba
+            )
+            if projected_states_ba is None:
+                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        else:
+            projected_states_qkvz, projected_states_ba = fused_projections
 
         # ============================================================
         # Part 2: Core Attention
         # ============================================================
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        decode_buffers = getattr(self, "_esimd_gdn_decode_buffers", None)
+        use_decode_buffers = (
+            0 < num_tokens <= 128 and hidden_states.dtype == torch.float16
         )
-        z = torch.empty_like(core_attn_out)
+        if use_decode_buffers:
+            if decode_buffers is None:
+                decode_buffers = (
+                    torch.empty(
+                        (128, self.num_v_heads // self.tp_size, self.head_v_dim),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                    torch.empty(
+                        (128, self.num_v_heads // self.tp_size, self.head_v_dim),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                )
+                self._esimd_gdn_decode_buffers = decode_buffers
+            core_attn_out = decode_buffers[0][:num_tokens]
+            z = decode_buffers[1][:num_tokens]
+        else:
+            core_attn_out = torch.zeros(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            z = torch.empty_like(core_attn_out)
 
-        torch.ops.vllm.gdn_attention_core_xpu(
-            core_attn_out,
-            z,
+        handled = try_esimd_gdn_core_decode(
+            self,
             projected_states_qkvz,
             projected_states_ba,
-            self.prefix,
+            core_attn_out,
+            z,
         )
+        if not handled:
+            handled = try_esimd_gdn_core_spec_decode(
+                self,
+                projected_states_qkvz,
+                projected_states_ba,
+                core_attn_out,
+                z,
+            )
+        if not handled:
+            if use_decode_buffers:
+                core_attn_out.zero_()
+            torch.ops.vllm.gdn_attention_core_xpu(
+                core_attn_out,
+                z,
+                projected_states_qkvz,
+                projected_states_ba,
+                self.prefix,
+            )
 
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
+        fused_output = try_esimd_gdn_output_projection(self, core_attn_out, z)
+        if fused_output is not None:
+            return fused_output
+
+        # Batched pure-decode (2 <= M <= 128): replace the Triton
+        # RMSNormGated (layer_norm_fwd_kernel) with the ESIMD gated RMSNorm,
+        # matching v0.21.0. Only the norm is fused; out_proj still runs its
+        # own M>1 GEMM path below.
+        normed_batched = try_esimd_gdn_output_norm_batched(self, core_attn_out, z)
+        if normed_batched is not None:
+            out, _ = self.out_proj(normed_batched)
+            return out
+
         z_shape_og = z.shape
         # Reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])

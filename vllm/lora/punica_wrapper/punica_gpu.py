@@ -436,6 +436,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         offset: int = 0,
         token_lora_mapping: torch.Tensor | None = None,
         add_inputs: bool = True,
+        a_row_mapping: torch.Tensor | None = None,
+        c_row_mapping: torch.Tensor | None = None,
     ):
         """
         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
@@ -492,6 +494,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             fully_sharded,
             offset,
             add_inputs,
+            a_row_mapping,
+            c_row_mapping,
         )
 
     def add_lora_w13(
@@ -516,6 +520,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         use_tuned_config: bool,
         add_inputs: bool = True,
         token_lora_mapping: torch.Tensor | None = None,
+        c_row_mapping: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -621,6 +626,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             fully_sharded=fully_sharded,
             token_lora_mapping=token_lora_mapping,
             add_inputs=add_inputs,
+            c_row_mapping=c_row_mapping,
         )
 
         return (
@@ -652,6 +658,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         tp_rank: int,
         use_tuned_config: bool,
         add_inputs: bool = True,
+        row_mapping: torch.Tensor | None = None,
+        mul_routed_weight: bool = True,
     ) -> None:
         import functools
 
@@ -730,9 +738,11 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             shrink_config,
             expand_config,
             adapter_enabled,
-            True,  # mul_routed_weight
+            mul_routed_weight,
             fully_sharded=fully_sharded,
             offset=offset,
             token_lora_mapping=token_lora_mapping,
             add_inputs=add_inputs,
+            a_row_mapping=row_mapping,
+            c_row_mapping=row_mapping,
         )

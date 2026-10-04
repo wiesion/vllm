@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, overload
 
 import torch
@@ -14,6 +15,9 @@ if TYPE_CHECKING:
 
 
 class BaseLayerWithLoRA(nn.Module):
+    adapter_enabled_cpu: list[bool]
+    adapter_ranks_cpu: list[int]
+
     @overload
     def slice_lora_a(
         self, lora_a: list[torch.Tensor | None]
@@ -65,6 +69,14 @@ class BaseLayerWithLoRA(nn.Module):
         punica_wrapper,
     ):
         self.punica_wrapper: PunicaWrapperBase = punica_wrapper
+        self._has_active_lora: Callable[[list[bool] | None], bool] | None = getattr(
+            punica_wrapper, "has_active_lora", None
+        )
+
+    def is_lora_active(self) -> bool:
+        if self._has_active_lora is None:
+            return True
+        return self._has_active_lora(self.adapter_enabled_cpu)
 
     @classmethod
     def can_replace_layer(

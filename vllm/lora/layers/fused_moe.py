@@ -92,7 +92,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
         self._moe_kernel = moe_kernel
         self.base_layer._replace_quant_method(
-            FusedMoEModularMethod(self.base_layer._quant_method, moe_kernel)
+            FusedMoEModularMethod(
+                self.base_layer._quant_method,
+                moe_kernel,
+                use_modular_kernel=self._has_active_moe_lora,
+            )
         )
 
     @property
@@ -132,6 +136,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # second pair starts only after intermediate_cache1.add_() has joined.
         self._events = tuple(torch.cuda.Event() for _ in range(4))
 
+    def _has_active_moe_lora(self) -> bool:
+        punica_wrapper = getattr(self, "punica_wrapper", None)
+        has_active_lora = getattr(punica_wrapper, "has_active_lora", None)
+        adapter_enabled_cpu = getattr(self, "adapter_enabled_cpu", None)
+        if has_active_lora is None or adapter_enabled_cpu is None:
+            return True
+        return has_active_lora(adapter_enabled_cpu)
+
     def _build_lora_context(self):
         use_dual_stream = (
             self._enable_aux_cuda_stream
@@ -144,6 +156,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             w2_lora_a_stacked=self.w2_lora_a_stacked,
             w2_lora_b_stacked=self.w2_lora_b_stacked,
             adapter_enabled=self.adapter_enabled,
+            adapter_enabled_cpu=self.adapter_enabled_cpu,
             max_loras=self.max_loras,
             top_k=self.moe_config.experts_per_token,
             w13_num_slices=self._w13_slices,
@@ -173,21 +186,32 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         max_loras: int,
         lora_config: LoRAConfig,
     ):
-        self.w13_lora_a_stacked: tuple[torch.Tensor, ...] = tuple(
-            torch.zeros(
-                (
-                    max_loras,
-                    self._w13_a_num_experts,
-                    lora_config.max_lora_rank
-                    if not self.fully_sharded
-                    else divide(lora_config.max_lora_rank, self.tp_size),
-                    self.hidden_size,
-                ),
+        w13_a_shape = (
+            max_loras,
+            self._w13_a_num_experts,
+            lora_config.max_lora_rank
+            if not self.fully_sharded
+            else divide(lora_config.max_lora_rank, self.tp_size),
+            self.hidden_size,
+        )
+        if current_platform.is_xpu():
+            # XPU Triton cannot dereference a device-side pointer table. Keep
+            # slices adjacent so the kernel can address slice i as base+i*size.
+            w13_a_storage = torch.zeros(
+                (self._w13_slices, *w13_a_shape),
                 dtype=lora_config.lora_dtype,
                 device=self.device,
             )
-            for _ in range(self._w13_slices)
-        )
+            self.w13_lora_a_stacked = tuple(w13_a_storage.unbind(0))
+        else:
+            self.w13_lora_a_stacked = tuple(
+                torch.zeros(
+                    w13_a_shape,
+                    dtype=lora_config.lora_dtype,
+                    device=self.device,
+                )
+                for _ in range(self._w13_slices)
+            )
         self.w2_lora_a_stacked: tuple[torch.Tensor, ...] = (
             torch.zeros(
                 (
@@ -202,19 +226,28 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
 
     def _create_lora_b_weights(self, max_loras: int, lora_config: LoRAConfig):
-        self.w13_lora_b_stacked: tuple[torch.Tensor, ...] = tuple(
-            torch.zeros(
-                (
-                    max_loras,
-                    self.local_num_experts,
-                    self.intermediate_size_per_partition,
-                    lora_config.max_lora_rank,
-                ),
+        w13_b_shape = (
+            max_loras,
+            self.local_num_experts,
+            self.intermediate_size_per_partition,
+            lora_config.max_lora_rank,
+        )
+        if current_platform.is_xpu():
+            w13_b_storage = torch.zeros(
+                (self._w13_slices, *w13_b_shape),
                 dtype=lora_config.lora_dtype,
                 device=self.device,
             )
-            for _ in range(self._w13_slices)
-        )
+            self.w13_lora_b_stacked = tuple(w13_b_storage.unbind(0))
+        else:
+            self.w13_lora_b_stacked = tuple(
+                torch.zeros(
+                    w13_b_shape,
+                    dtype=lora_config.lora_dtype,
+                    device=self.device,
+                )
+                for _ in range(self._w13_slices)
+            )
         self.w2_lora_b_stacked: tuple[torch.Tensor, ...] = (
             torch.zeros(
                 (
@@ -232,6 +265,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
     def _ep_check(self):
         if self.use_ep:
+            expert_placement_strategy = self.base_layer.expert_placement_strategy
+            if expert_placement_strategy != "linear":
+                raise ValueError(
+                    "Fused MoE LoRA with EP requires linear expert placement "
+                    "because adapter loading assumes contiguous expert ownership; "
+                    f"got '{expert_placement_strategy}'."
+                )
             moe_config = self.moe_config
             all2all_backend = moe_config.moe_parallel_config.all2all_backend
             assert all2all_backend == "allgather_reducescatter", (
@@ -266,6 +306,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.adapter_enabled = torch.tensor(
             [0] * (max_loras + 1), dtype=torch.int, device=self.device
         )
+        self.adapter_enabled_cpu = [False] * max_loras
 
         self._create_lora_a_weights(max_loras, lora_config)
         self._create_lora_b_weights(max_loras, lora_config)
@@ -381,6 +422,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_a_stacked[0][index] = 0
         self.w2_lora_b_stacked[0][index] = 0
         self.adapter_enabled[index] = 0
+        self.adapter_enabled_cpu[index] = False
 
     #
 
@@ -451,6 +493,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_b_stacked[0][
             index, :, : sliced_w2_lora_b.shape[1], : sliced_w2_lora_b.shape[2]
         ].copy_(sliced_w2_lora_b, non_blocking=True)
+        self.adapter_enabled_cpu[index] = True
 
     def set_mapping(self, punica_wrapper):
         super().set_mapping(punica_wrapper)
@@ -549,6 +592,7 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
         self.adapter_enabled = torch.tensor(
             [0] * (max_loras + 1), dtype=torch.int, device=self.device
         )
+        self.adapter_enabled_cpu = [False] * max_loras
 
         self._create_lora_a_weights(max_loras, lora_config)
         self._create_lora_b_weights(max_loras, lora_config)
@@ -619,6 +663,7 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
         self.w2_lora_b_stacked[0][
             index, :, : sliced_w2_lora_b.shape[1], : sliced_w2_lora_b.shape[2]
         ].copy_(sliced_w2_lora_b, non_blocking=True)
+        self.adapter_enabled_cpu[index] = True
 
     @property
     def w13_input_size(self):

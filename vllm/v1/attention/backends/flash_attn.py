@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.esimd_utils import load_esimd_library
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
@@ -27,7 +29,10 @@ from vllm.v1.attention.backends.fa_utils import (
     is_fa_version_supported,
     is_flash_attn_varlen_func_available,
 )
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    is_valid_esimd_page_attention_input,
+)
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
@@ -66,6 +71,9 @@ from vllm.v1.worker.cp_utils import (
 )
 
 logger = init_logger(__name__)
+_DISABLE_XPU_DRAFT_METADATA_REUSE = (
+    os.environ.get("DISABLE_XPU_DRAFT_METADATA_REUSE", "0") == "1"
+)
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -169,6 +177,10 @@ class FlashAttentionBackend(AttentionBackend):
         if head_size % 8 != 0:
             return False
         if head_size <= 256:
+            return True
+        # XPU uses the varlen implementation for Gemma4 full-attention
+        # layers with head_size=512.
+        if current_platform.is_xpu() and head_size <= 512:
             return True
         if is_fa_version_supported(4):
             return head_size <= 512
@@ -374,6 +386,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.kv_cache_dtype = kv_cache_spec.dtype
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
+        self.force_gemma4_single_split = (
+            current_platform.is_xpu()
+            and os.environ.get("VLLM_XPU_GEMMA4_SINGLE_SPLIT") == "1"
+            and any(
+                "Gemma4" in architecture
+                for architecture in self.model_config.architectures
+            )
+        )
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
@@ -444,6 +464,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 [self.rswa_window], dtype=torch.int32, device=self.device
             )
 
+        # Draft MTP steps only change the scalar/query/cache tensor fields.
+        # Keep the fast-build metadata object and update those fields in place
+        # instead of reconstructing it for every sequential draft token.
+        self._draft_metadata: FlashAttentionMetadata | None = None
+
     def build(
         self,
         common_prefix_len: int,
@@ -498,7 +523,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # we only set num_splits when using cuda graphs.
             max_num_splits = self.max_num_splits
 
-        if envs.VLLM_BATCH_INVARIANT:
+        if envs.VLLM_BATCH_INVARIANT or (
+            self.force_gemma4_single_split
+            and max_query_len == 1
+            and num_actual_tokens == num_reqs
+        ):
             max_num_splits = 1
 
         def schedule(
@@ -714,6 +743,52 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         return attn_metadata
 
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> FlashAttentionMetadata:
+        """Reuse fast-build metadata across sequential draft steps."""
+        if not current_platform.is_xpu():
+            return super().build_for_drafting(common_attn_metadata, draft_index)
+
+        if (
+            _DISABLE_XPU_DRAFT_METADATA_REUSE
+            or draft_index == 0
+            or self._draft_metadata is None
+        ):
+            metadata = self.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,
+            )
+            reusable = (
+                not metadata.use_cascade
+                and metadata.dcp_context_kv_lens is None
+                and metadata.scheduler_metadata is None
+                and metadata.prefix_scheduler_metadata is None
+                and metadata.cu_prefix_query_lens is None
+                and metadata.prefix_kv_lens is None
+                and metadata.suffix_kv_lens is None
+                and metadata.mm_prefix_range_tensor is None
+                and metadata.rswa_prefix_lens is None
+                and metadata.rswa_window is None
+                and metadata.rswa_window_tensor is None
+            )
+            self._draft_metadata = metadata if reusable else None
+            return metadata
+
+        metadata = self._draft_metadata
+        metadata.num_actual_tokens = common_attn_metadata.num_actual_tokens
+        metadata.max_query_len = common_attn_metadata.max_query_len
+        metadata.query_start_loc = common_attn_metadata.query_start_loc
+        metadata.max_seq_len = common_attn_metadata.max_seq_len
+        metadata.seq_lens = common_attn_metadata.seq_lens
+        metadata.block_table = common_attn_metadata.block_table_tensor
+        metadata.slot_mapping = common_attn_metadata.slot_mapping
+        metadata.causal = common_attn_metadata.causal
+        return metadata
+
     def update_block_table(
         self,
         metadata: FlashAttentionMetadata,
@@ -802,11 +877,25 @@ class FlashAttentionImpl(AttentionImpl):
 
         self._dcp_dtype: torch.dtype | None = None
         self._dcp_max_num_tokens: int = 0
+        self._esimd_page_attn_checked = False
+        self._esimd_page_attn_op = None
         if vllm_config is not None and self.dcp_world_size > 1:
             self._dcp_dtype = vllm_config.model_config.dtype
             self._dcp_max_num_tokens = (
                 vllm_config.scheduler_config.max_num_batched_tokens
             )
+
+    def _get_esimd_page_attn_op(self):
+        if self._esimd_page_attn_checked:
+            return self._esimd_page_attn_op
+
+        self._esimd_page_attn_checked = True
+        try:
+            load_esimd_library("eagle_ops")
+            self._esimd_page_attn_op = torch.ops.eagle_ops.page_attn_decode_separate
+        except (AttributeError, ImportError, OSError):
+            self._esimd_page_attn_op = None
+        return self._esimd_page_attn_op
 
     def forward(
         self,
@@ -917,6 +1006,74 @@ class FlashAttentionImpl(AttentionImpl):
             k_descale = layer._k_scale.expand(descale_shape)
             v_descale = layer._v_scale.expand(descale_shape)
 
+            page_window = (
+                attn_metadata.sliding_window
+                if attn_metadata.sliding_window is not None
+                else self.sliding_window
+            )
+            page_attn_op = self._get_esimd_page_attn_op()
+            if (
+                page_attn_op is not None
+                and os.environ.get("DISABLE_ESIMD_PAGE_ATTN") != "1"
+                and current_platform.is_xpu()
+                and self.dcp_world_size == 1
+                and attn_type == AttentionType.DECODER
+                and attn_metadata.max_query_len == 1
+                and query[:num_actual_tokens].shape[0]
+                == attn_metadata.seq_lens.shape[0]
+                and self.head_size == 256
+                and self.num_queries_per_kv >= 2
+                and page_window[0] == -1
+                and self.logits_soft_cap == 0
+                and self.sinks is None
+                and self.alibi_slopes is None
+                and attn_metadata.mm_prefix_range_tensor is None
+                and attn_metadata.rswa_prefix_lens is None
+                and attn_metadata.causal is True
+                and is_valid_esimd_page_attention_input(
+                    query[:num_actual_tokens],
+                    output[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                )
+                and key_cache.shape[3] == self.head_size
+            ):
+                num_q_heads = query.shape[1]
+                num_kv_heads = key_cache.shape[2]
+                gqa_ratio = num_q_heads // num_kv_heads if num_kv_heads > 0 else 0
+                if (
+                    num_kv_heads > 0
+                    and gqa_ratio * num_kv_heads == num_q_heads
+                    and (gqa_ratio == 2 or gqa_ratio >= 4 and gqa_ratio % 4 == 0)
+                ):
+                    page_query = query[:num_actual_tokens]
+                    kernel_scale = 1.0 / (self.head_size**0.5)
+                    if abs(self.scale - kernel_scale) > 1e-6:
+                        page_query = (page_query * (self.scale / kernel_scale)).half()
+                    k_scale = (
+                        float(layer._k_scale)
+                        if is_quantized_kv_cache(self.kv_cache_dtype)
+                        else 1.0
+                    )
+                    v_scale = (
+                        float(layer._v_scale)
+                        if is_quantized_kv_cache(self.kv_cache_dtype)
+                        else 1.0
+                    )
+                    page_attn_op(
+                        page_query,
+                        key_cache,
+                        value_cache,
+                        block_table,
+                        seqused_k,
+                        output[:num_actual_tokens],
+                        1,
+                        max_seqlen_k,
+                        k_scale,
+                        v_scale,
+                    )
+                    return output
+
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
@@ -1000,16 +1157,24 @@ class FlashAttentionImpl(AttentionImpl):
 
                 dynamic_causal = None
                 if isinstance(causal, torch.Tensor):
-                    if self.vllm_flash_attn_version != 4:
+                    if current_platform.is_xpu():
+                        # XPU FA2 has a native per-sequence causal input.
+                        # Keep the compile-time causal path enabled so the
+                        # kernel can apply the per-request mask.
+                        dynamic_causal = causal
+                        causal = True
+                    elif self.vllm_flash_attn_version != 4:
                         raise NotImplementedError(
                             "Per-sequence causal requires FA4. Current version: "
                             f"FA{self.vllm_flash_attn_version}"
                         )
-                    dynamic_causal = causal
-                    has_window = (
-                        sliding_window_size is not None and sliding_window_size[1] >= 0
-                    )
-                    causal = not has_window
+                    else:
+                        dynamic_causal = causal
+                        has_window = (
+                            sliding_window_size is not None
+                            and sliding_window_size[1] >= 0
+                        )
+                        causal = not has_window
 
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
@@ -1036,6 +1201,7 @@ class FlashAttentionImpl(AttentionImpl):
                     s_aux=self.sinks,
                     mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                     aux_tensors=rswa_aux or mm_aux,
+                    is_mix_batch=False,
                 )
                 return output
 

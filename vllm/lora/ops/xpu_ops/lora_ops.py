@@ -6,6 +6,18 @@ import torch
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+def _has_xpu_op(torch_ops: object, op_name: str) -> bool:
+    xpu_ops = getattr(torch_ops, "_xpu_C", None)
+    return xpu_ops is not None and hasattr(xpu_ops, op_name)
+
+
+_HAS_FUSED_LORA_LINEAR = _has_xpu_op(torch.ops, "lora_linear")
+
+
+def has_fused_lora_linear() -> bool:
+    return _HAS_FUSED_LORA_LINEAR
+
+
 def _bgmv_shrink_impl(
     inputs: torch.Tensor,
     lora_a_weights: torch.Tensor,
@@ -16,6 +28,42 @@ def _bgmv_shrink_impl(
     torch.ops._xpu_C.bgmv_shrink(
         output_tensor, inputs, lora_a_weights, lora_indices_tensor, scaling
     )
+
+
+def _bgmv_linear_impl(
+    inputs: torch.Tensor,
+    lora_a_weights: list[torch.Tensor],
+    lora_b_weights: list[torch.Tensor],
+    output_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    scaling: float,
+    output_slices: list[int],
+    active_rank: int,
+    add_inputs: bool,
+) -> None:
+    if _HAS_FUSED_LORA_LINEAR:
+        torch.ops._xpu_C.lora_linear(
+            inputs,
+            lora_a_weights,
+            lora_b_weights,
+            output_tensor,
+            lora_indices_tensor,
+            scaling,
+            active_rank,
+            add_inputs,
+        )
+    else:
+        torch.ops._xpu_C.bgmv_linear(
+            output_tensor,
+            inputs,
+            lora_a_weights,
+            lora_b_weights,
+            lora_indices_tensor,
+            scaling,
+            output_slices,
+            active_rank,
+            add_inputs,
+        )
 
 
 def _bgmv_expand_impl(
@@ -95,6 +143,20 @@ def _bgmv_shrink_fake(
     return None
 
 
+def _bgmv_linear_fake(
+    inputs: torch.Tensor,
+    lora_a_weights: list[torch.Tensor],
+    lora_b_weights: list[torch.Tensor],
+    output_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    scaling: float,
+    output_slices: list[int],
+    active_rank: int,
+    add_inputs: bool,
+) -> None:
+    return None
+
+
 def _bgmv_expand_fake(
     inputs: torch.Tensor,
     lora_b_weights: torch.Tensor,
@@ -125,6 +187,13 @@ direct_register_custom_op(
 )
 
 direct_register_custom_op(
+    op_name="xpu_bgmv_linear",
+    op_func=_bgmv_linear_impl,
+    mutates_args=["output_tensor"],
+    fake_impl=_bgmv_linear_fake,
+)
+
+direct_register_custom_op(
     op_name="xpu_bgmv_expand",
     op_func=_bgmv_expand_impl,
     mutates_args=["output_tensor"],
@@ -148,6 +217,30 @@ def bgmv_shrink(
 ) -> None:
     torch.ops.vllm.xpu_bgmv_shrink(
         inputs, lora_a_weights, output_tensor, lora_indices_tensor, scaling
+    )
+
+
+def bgmv_linear(
+    inputs: torch.Tensor,
+    lora_a_weights: list[torch.Tensor],
+    lora_b_weights: list[torch.Tensor],
+    output_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    output_slices: list[int],
+    active_rank: int,
+    scaling: float = 1.0,
+    add_inputs: bool = True,
+) -> None:
+    torch.ops.vllm.xpu_bgmv_linear(
+        inputs,
+        lora_a_weights,
+        lora_b_weights,
+        output_tensor,
+        lora_indices_tensor,
+        scaling,
+        output_slices,
+        active_rank,
+        add_inputs,
     )
 
 

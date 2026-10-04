@@ -18,6 +18,7 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
+import os
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
@@ -37,6 +38,10 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.esimd_utils import (
+    get_esimd_op,
+    load_esimd_library,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
@@ -83,6 +88,136 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+GEMMA4_MOE_LORA_EXPERTS_PATTERN = re.compile(
+    r"(?<!\.moe)\.experts(?=\.(?:base_layer\.)?lora_[AB]\.weight$)"
+)
+
+_ESIMD_OP_CACHE: dict[str, object | None] = {}
+
+_ESIMD_NORM_ENABLED = (
+    current_platform.is_xpu()
+    and os.environ.get("DISABLE_ESIMD_NORM", "0") != "1"
+)
+_ESIMD_ROUTER_GEMV_ENABLED = (
+    current_platform.is_xpu()
+    and os.environ.get("DISABLE_ESIMD_ROUTER_GEMV", "0") != "1"
+)
+_GEMMA4_ROUTER_DECODE_ENABLED = (
+    os.environ.get("DISABLE_GEMMA4_ROUTER_DECODE", "0") != "1"
+)
+_GEMMA4_XFUSE_ENABLED = (
+    _ESIMD_NORM_ENABLED
+    and os.environ.get("DISABLE_GEMMA4_XFUSE", "0") != "1"
+)
+_GEMMA4_FUSED_ATTN_OUT_ENABLED = (
+    _ESIMD_NORM_ENABLED
+    and os.environ.get("DISABLE_GEMMA4_FUSED_ATTN_OUT", "0") != "1"
+)
+_GEMMA4_FUSED_PRE_FF_ENABLED = (
+    _ESIMD_NORM_ENABLED
+    and os.environ.get("DISABLE_GEMMA4_FUSED_PRE_FF", "0") != "1"
+)
+_GEMMA4_FUSED_ROUTER_ENABLED = (
+    _ESIMD_NORM_ENABLED
+    and os.environ.get("DISABLE_GEMMA4_FUSED_ROUTER", "0") != "1"
+)
+_GEMMA4_FUSED_H2_ENABLED = (
+    _ESIMD_NORM_ENABLED
+    and os.environ.get("DISABLE_GEMMA4_FUSED_H2", "0") != "1"
+)
+_GEMMA4_FUSED_H2_ADD_ENABLED = (
+    _ESIMD_NORM_ENABLED
+    and os.environ.get("DISABLE_GEMMA4_FUSED_H2_ADD", "0") != "1"
+)
+_MOE_PROD_TOPK_ENABLED = (
+    current_platform.is_xpu()
+    and os.environ.get("DISABLE_MOE_PROD_TOPK", "0") != "1"
+)
+_MOE_PROD_TOPK_BATCH_ENABLED = (
+    current_platform.is_xpu()
+    and os.environ.get("DISABLE_MOE_PROD_TOPK_BATCH", "0") != "1"
+)
+_MOE_BATCH_GROUPED_ENABLED = (
+    current_platform.is_xpu()
+    and os.environ.get("DISABLE_ESIMD_MOE_BATCH_GROUPED", "0") != "1"
+    and os.environ.get("ENABLE_ESIMD_MOE_BATCH_GROUPED", "0") == "1"
+)
+_MOE_GELU_ENABLED = os.environ.get("DISABLE_ESIMD_MOE_GELU", "0") != "1"
+_MOE_GROUPED_MAX_M = int(os.environ.get("MOE_GROUPED_MAX_M", "2048"))
+_MOE_FULL_FUSED_ENABLED = (
+    os.environ.get("ENABLE_GEMMA4_FULL_FUSED_MOE", "1") == "1"
+    and os.environ.get("DISABLE_MOE_FULL_FUSED", "0") != "1"
+)
+_GEMMA4_INT4_DECODE_ENABLED = (
+    os.environ.get("ENABLE_GEMMA4_INT4_DECODE", "1") == "1"
+)
+_GEMMA4_INT4_BATCH_MAX_M = int(
+    os.environ.get("GEMMA4_INT4_BATCH_MAX_M", "1")
+)
+
+
+def _get_optional_esimd_op(name: str):
+    if name not in _ESIMD_OP_CACHE:
+        try:
+            _ESIMD_OP_CACHE[name] = get_esimd_op(name)
+        except (AttributeError, ImportError, OSError):
+            _ESIMD_OP_CACHE[name] = None
+    return _ESIMD_OP_CACHE[name]
+
+
+def _esimd_norm_enabled() -> bool:
+    return _ESIMD_NORM_ENABLED
+
+
+def _esimd_rms_norm_or_fallback(
+    norm_module: RMSNorm,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        not _esimd_norm_enabled()
+        or hidden_states.shape[0] != 1
+        or not hidden_states.is_contiguous()
+        or hidden_states.dtype != torch.float16
+        or norm_module.weight is None
+        or norm_module.weight.dtype != torch.float16
+    ):
+        return norm_module(hidden_states)
+
+    op = _get_optional_esimd_op("esimd_rms_norm")
+    if op is None:
+        return norm_module(hidden_states)
+
+    output = getattr(norm_module, "_esimd_out_buf", None)
+    if (
+        output is None
+        or output.shape != hidden_states.shape
+        or output.device != hidden_states.device
+    ):
+        output = torch.empty_like(hidden_states)
+        norm_module._esimd_out_buf = output
+    op(
+        hidden_states,
+        output,
+        norm_module.weight.detach(),
+        norm_module.variance_epsilon,
+    )
+    return output
+
+
+def _pad_int4_input(
+    inputs: torch.Tensor,
+    packed_weight: torch.Tensor,
+) -> torch.Tensor | None:
+    required_k = packed_weight.shape[-1] * 2
+    input_k = inputs.shape[-1]
+    if input_k == required_k:
+        return inputs
+    if input_k < required_k:
+        return torch.nn.functional.pad(
+            inputs, (0, required_k - input_k)
+        ).contiguous()
+    return None
 
 
 def _remap_gemma4_expert_weight_name(name: str) -> str:
@@ -240,8 +375,308 @@ class Gemma4MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = get_act_and_mul_fn(hidden_activation)
+        _quant_name = quant_config.get_name() if quant_config is not None else ""
+        _fp8_esimd_opt_in = os.environ.get("ENABLE_ESIMD_DENSE", "0") == "1"
+        self._fp8_esimd_enabled = (
+            _quant_name == "fp8"
+            and current_platform.is_xpu()
+            and os.environ.get("DISABLE_GEMMA4_FP8_DENSE_ESIMD", "0") != "1"
+        )
+        self._fp8_esimd_ready = None
+        self._fp8_esimd_op = None
+        # The 26B shared MLP is faster on the ESIMD path at M=1 because it
+        # avoids the higher eager dispatch cost of two generic FP8 linears.
+        self._fp8_min_bsz = (
+            1 if _fp8_esimd_opt_in or hidden_size == 2816 else 2
+        )
+        self._fp8_max_bsz = int(
+            os.environ.get("MAX_DECODE_BSZ", "64" if _fp8_esimd_opt_in else "4")
+        )
+        self._int4_esimd_enabled = (
+            quant_config is not None
+            and quant_config.get_name() == "sym_int4"
+            and current_platform.is_xpu()
+            and os.environ.get("ENABLE_GEMMA4_INT4_DENSE_ESIMD", "1") == "1"
+            and os.environ.get("DISABLE_GEMMA4_INT4_DENSE_ESIMD", "0") != "1"
+        )
+        self._int4_esimd_ready = None
+        self._int4_gate_up = None
+        self._int4_down = None
+        self._int4_esimd_batch_enabled = (
+            self._int4_esimd_enabled
+            and os.environ.get("ENABLE_ESIMD_INT4_GEMM", "0") == "1"
+            and os.environ.get("DISABLE_GEMMA4_INT4_BATCH_ESIMD", "1") != "1"
+        )
+        self._int4_esimd_batch_max_bsz = int(
+            os.environ.get("MAX_DECODE_BSZ", "64")
+        )
+        self._fp16_mtp_esimd_enabled = (
+            quant_config is None
+            and current_platform.is_xpu()
+            and os.environ.get("DISABLE_GEMMA4_MTP_FUSED_MLP", "0") != "1"
+        )
+        self._fp16_mtp_esimd_ready = None
+        self._fp16_mtp_esimd_op = None
+        self._fp16_mtp_gate_up = None
+        self._fp16_mtp_out = None
+
+    def _probe_fp8_esimd(self) -> bool:
+        try:
+            gate_weight = self.gate_up_proj.weight
+            gate_scale = self.gate_up_proj.weight_scale
+            down_weight = self.down_proj.weight
+            down_scale = self.down_proj.weight_scale
+            op = get_esimd_op("esimd_gemm_fp8_pert")
+        except (AttributeError, ImportError, OSError):
+            return False
+
+        if any(
+            weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+            or weight.ndim != 2
+            or not weight.is_contiguous()
+            for weight in (gate_weight, down_weight)
+        ):
+            return False
+        if any(
+            scale.dtype != torch.float32
+            or scale.numel() != 1
+            or not scale.is_contiguous()
+            for scale in (gate_scale, down_scale)
+        ):
+            return False
+
+        device = gate_weight.device
+        self._fp8_esimd_op = op
+        self._fp8_gate_weight = gate_weight
+        self._fp8_gate_scale = gate_scale
+        self._fp8_down_weight = down_weight
+        self._fp8_down_scale = down_scale
+        self._fp8_gate_out = torch.empty(
+            self._fp8_max_bsz,
+            gate_weight.shape[0],
+            dtype=torch.float16,
+            device=device,
+        )
+        self._fp8_down_out = torch.empty(
+            self._fp8_max_bsz,
+            down_weight.shape[0],
+            dtype=torch.float16,
+            device=device,
+        )
+        self._fp8_tp = get_tensor_model_parallel_world_size()
+        return True
+
+    def _try_int4_esimd(self, x: torch.Tensor) -> torch.Tensor | None:
+        if not self._int4_esimd_enabled or x.shape[0] == 0:
+            return None
+        if x.dtype != torch.float16 or not x.is_contiguous():
+            return None
+
+        if x.shape[0] > 1:
+            if (
+                not self._int4_esimd_batch_enabled
+                or x.shape[0] > self._int4_esimd_batch_max_bsz
+            ):
+                return None
+            try:
+                gate_weight = self.gate_up_proj.weight_esimd
+                gate_scale = self.gate_up_proj.scale_esimd
+                down_weight = self.down_proj.weight_esimd
+                down_scale = self.down_proj.scale_esimd
+                from vllm.model_executor.layers.quantization._sym_int4_esimd import (
+                    try_esimd_int4_linear,
+                )
+            except (AttributeError, ImportError, OSError):
+                self._int4_esimd_ready = False
+                return None
+
+            # Validate both projections before enqueueing the first kernel.
+            # Gemma4-26B's shared MLP has a 1152-wide down input, which is
+            # outside the group-128 GEMM ABI.
+            down_k = down_weight.shape[1] * 2
+            if (
+                down_weight.dtype != torch.uint8
+                or down_scale.dtype != torch.float16
+                or not down_weight.is_contiguous()
+                or not down_scale.is_contiguous()
+                or down_weight.shape[0] % 16 != 0
+                or down_k % 128 != 0
+                or down_scale.shape != (down_weight.shape[0], down_k // 128)
+            ):
+                return None
+
+            gate_input = _pad_int4_input(x, gate_weight)
+            if gate_input is None:
+                return None
+            # M>1 forwards can be queued before a later scheduler step
+            # finishes consuming the previous result.  Do not reuse a
+            # module-level buffer across those asynchronous steps.
+            gate_output = torch.empty(
+                (x.shape[0], gate_weight.shape[0]),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            if (
+                try_esimd_int4_linear(
+                    gate_input,
+                    gate_weight,
+                    gate_scale,
+                    output=gate_output,
+                )
+                is None
+            ):
+                return None
+
+            activated = self.act_fn(gate_output)
+            down_input = _pad_int4_input(activated, down_weight)
+            if down_input is None:
+                return None
+            down_output = torch.empty(
+                (x.shape[0], down_weight.shape[0]),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            if (
+                try_esimd_int4_linear(
+                    down_input,
+                    down_weight,
+                    down_scale,
+                    output=down_output,
+                )
+                is None
+            ):
+                return None
+
+            if get_tensor_model_parallel_world_size() > 1:
+                from vllm.distributed import tensor_model_parallel_all_reduce
+
+                return tensor_model_parallel_all_reduce(down_output)
+            return down_output
+
+        try:
+            gate_weight = self.gate_up_proj.weight_esimd
+            gate_scale = self.gate_up_proj.scale_esimd
+            down_weight = self.down_proj.weight_esimd
+            down_scale = self.down_proj.scale_esimd
+            op = get_esimd_op("esimd_gemv_int4")
+        except (AttributeError, ImportError, OSError):
+            self._int4_esimd_ready = False
+            return None
+
+        gate_input = _pad_int4_input(x, gate_weight)
+        if gate_input is None:
+            return None
+        if self._int4_gate_up is None or self._int4_gate_up.shape != (
+            1,
+            gate_weight.shape[0],
+        ):
+            self._int4_gate_up = torch.empty(
+                (1, gate_weight.shape[0]), dtype=torch.float16, device=x.device
+            )
+        op(gate_input, gate_weight, gate_scale, self._int4_gate_up)
+
+        activated = self.act_fn(self._int4_gate_up)
+        down_input = _pad_int4_input(activated, down_weight)
+        if down_input is None:
+            return None
+        if self._int4_down is None or self._int4_down.shape != (
+            1,
+            down_weight.shape[0],
+        ):
+            self._int4_down = torch.empty(
+                (1, down_weight.shape[0]), dtype=torch.float16, device=x.device
+            )
+        op(down_input, down_weight, down_scale, self._int4_down)
+
+        if get_tensor_model_parallel_world_size() > 1:
+            from vllm.distributed import tensor_model_parallel_all_reduce
+
+            logger.info_once(
+                "Gemma4: using INT4 dense ESIMD decode path.",
+                scope="local",
+            )
+            return tensor_model_parallel_all_reduce(self._int4_down)
+        return self._int4_down
+
+    def _probe_fp16_mtp_esimd(self) -> bool:
+        weight = getattr(self.gate_up_proj, "weight", None)
+        if (
+            weight is None
+            or weight.dtype != torch.float16
+            or weight.ndim != 2
+            or weight.shape[0] % 2 != 0
+            or not weight.is_contiguous()
+        ):
+            return False
+
+        try:
+            op = get_esimd_op("esimd_gemv_fp16_gelu_mul")
+        except (AttributeError, ImportError, OSError):
+            return False
+
+        self._fp16_mtp_esimd_op = op
+        self._fp16_mtp_gate_up = weight
+        self._fp16_mtp_out = torch.empty(
+            (1, weight.shape[0] // 2),
+            dtype=torch.float16,
+            device=weight.device,
+        )
+        return True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._fp8_esimd_enabled:
+            n_tokens = x.shape[0]
+            if self._fp8_min_bsz <= n_tokens <= self._fp8_max_bsz:
+                if self._fp8_esimd_ready is None:
+                    self._fp8_esimd_ready = self._probe_fp8_esimd()
+                if (
+                    self._fp8_esimd_ready
+                    and x.dtype == torch.float16
+                    and x.is_contiguous()
+                    and x.shape[-1] == self._fp8_gate_weight.shape[1]
+                    and self._fp8_down_weight.shape[1]
+                    == self._fp8_gate_out.shape[1] // 2
+                ):
+                    gate_up = self._fp8_gate_out[:n_tokens]
+                    self._fp8_esimd_op(
+                        x,
+                        self._fp8_gate_weight,
+                        self._fp8_gate_scale,
+                        gate_up,
+                    )
+                    activated = self.act_fn(gate_up)
+                    down = self._fp8_down_out[:n_tokens]
+                    self._fp8_esimd_op(
+                        activated,
+                        self._fp8_down_weight,
+                        self._fp8_down_scale,
+                        down,
+                    )
+                    if self._fp8_tp > 1:
+                        from vllm.distributed import tensor_model_parallel_all_reduce
+
+                        down = tensor_model_parallel_all_reduce(down)
+                    return down
+
+        if self._fp16_mtp_esimd_enabled and x.shape[0] == 1:
+            if self._fp16_mtp_esimd_ready is None:
+                self._fp16_mtp_esimd_ready = self._probe_fp16_mtp_esimd()
+            if (
+                self._fp16_mtp_esimd_ready
+                and x.dtype == torch.float16
+                and x.is_contiguous()
+            ):
+                self._fp16_mtp_esimd_op(
+                    x, self._fp16_mtp_gate_up, self._fp16_mtp_out
+                )
+                output, _ = self.down_proj(self._fp16_mtp_out)
+                return output
+
+        if self._int4_esimd_ready is not False:
+            output = self._try_int4_esimd(x)
+            if output is not None:
+                self._int4_esimd_ready = True
+                return output
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -291,6 +726,41 @@ class Gemma4Router(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns raw router logits [T, E]."""
+        if (
+            x.shape[0] == 1
+            and _GEMMA4_ROUTER_DECODE_ENABLED
+        ):
+            if not hasattr(self, "_scale_with_root"):
+                self._scale_with_root = (
+                    self.scale.detach() * self.root_size
+                ).to(x.dtype).contiguous()
+            x = self.norm(x)
+            x = x * self._scale_with_root
+            if (
+                _ESIMD_ROUTER_GEMV_ENABLED
+                and x.is_contiguous()
+                and self.proj.weight.is_contiguous()
+                and x.dtype == torch.float16
+                and self.proj.weight.dtype == torch.float16
+                and getattr(self, "_router_esimd_ready", None) is not False
+            ):
+                try:
+                    op = get_esimd_op("esimd_gemv_fp16")
+                except (AttributeError, ImportError, OSError):
+                    self._router_esimd_ready = False
+                else:
+                    if not hasattr(self, "_router_logits_buf"):
+                        self._router_logits_buf = torch.empty(
+                            1,
+                            self.proj.weight.shape[0],
+                            dtype=torch.float16,
+                            device=x.device,
+                        )
+                    op(x, self.proj.weight, self._router_logits_buf)
+                    self._router_esimd_ready = True
+                    return self._router_logits_buf
+            return torch.nn.functional.linear(x, self.proj.weight)
+
         x = self.norm(x)
         x = x * self.root_size.to(x.dtype)
         x = x * self.scale.to(x.dtype)
@@ -329,12 +799,71 @@ class Gemma4MoE(nn.Module):
         # NOTE: self.per_expert_scale is read at call time (not captured into
         # a local) so that torch.func.functional_call parameter substitution
         # reaches the routing function correctly.
+        self._prod_topk_ready = None
+        self._prod_topk_op = None
+
         def routing_function(
             hidden_states: torch.Tensor,
             gating_output: torch.Tensor,
             topk: int,
             renormalize: bool,
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            if (
+                _MOE_PROD_TOPK_ENABLED
+                and gating_output.shape[0] == 1
+                and renormalize
+                and gating_output.dtype == torch.float16
+                and gating_output.is_contiguous()
+                and gating_output.shape[-1] <= 512
+                and gating_output.shape[-1] % 16 == 0
+                and topk <= 32
+                and self._prod_topk_ready is not False
+            ):
+                if self._prod_topk_ready is None:
+                    try:
+                        load_esimd_library("moe_ops")
+                        self._prod_topk_op = torch.ops.moe_ops.moe_topk
+                    except (AttributeError, ImportError, OSError):
+                        self._prod_topk_ready = False
+                    else:
+                        self._prod_topk_ready = True
+                if self._prod_topk_ready:
+                    topk_ids, topk_weights = self._prod_topk_op(
+                        gating_output, topk, True
+                    )
+                    topk_weights = topk_weights * self.per_expert_scale[
+                        topk_ids.long()
+                    ].to(torch.float16)
+                    return topk_weights, topk_ids
+
+            if (
+                _MOE_PROD_TOPK_BATCH_ENABLED
+                and gating_output.shape[0] > 1
+                and renormalize
+                and gating_output.shape[-1] == 128
+                and topk == 8
+                and self._prod_topk_ready is not False
+            ):
+                if self._prod_topk_ready is None:
+                    try:
+                        load_esimd_library("moe_ops")
+                        self._prod_topk_op = torch.ops.moe_ops.moe_topk
+                    except (AttributeError, ImportError, OSError):
+                        self._prod_topk_ready = False
+                    else:
+                        self._prod_topk_ready = True
+                if self._prod_topk_ready:
+                    # The production op accepts fp16 logits but performs the
+                    # softmax/top-k accumulation internally in fp32.
+                    topk_ids, topk_weights = self._prod_topk_op(
+                        gating_output.to(torch.float16).contiguous(), topk, True
+                    )
+                    topk_weights = topk_weights.to(torch.float32)
+                    topk_weights = topk_weights * self.per_expert_scale[
+                        topk_ids.long()
+                    ].to(torch.float32)
+                    return topk_weights, topk_ids
+
             if current_platform.is_cuda_alike() or current_platform.is_xpu():
                 return gemma4_fused_routing_kernel_triton(
                     gating_output, topk, self.per_expert_scale
@@ -360,8 +889,411 @@ class Gemma4MoE(nn.Module):
             custom_routing_function=routing_function,
             activation="gelu_tanh",
         )
+        self._full_moe_ready = None
+        self._full_moe_op = None
+        self._full_moe_w13 = None
+        self._full_moe_w13_scale = None
+        self._full_moe_w2 = None
+        self._full_moe_w2_scale = None
+        self._esimd_routing_fn = routing_function
+        self._top_k = config.top_k_experts
+        self._n_routed_experts = config.num_experts
+        self._esimd_batch_ready = None
+        self._esimd_batch_gather = None
+        self._esimd_batch_full = None
+        self._esimd_batch_full_native = None
+        self._esimd_grouped_weights_ready = None
+        self._esimd_grouped_w13 = None
+        self._esimd_grouped_w13_scale = None
+        self._esimd_grouped_w2 = None
+        self._esimd_grouped_w2_scale = None
+        self._esimd_grouped_native_layout = False
+        self._int4_moe_ready = None
+        self._int4_moe_op = None
+        self._int4_moe_w13 = None
+        self._int4_moe_w13_scale = None
+        self._int4_moe_w2 = None
+        self._int4_moe_w2_scale = None
+
+    def _get_grouped_moe_weights(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool] | None:
+        if self._esimd_grouped_weights_ready is False:
+            return None
+        if self._esimd_grouped_weights_ready is None:
+            try:
+                experts = self.experts.routed_experts
+                w13 = experts.w13_weight
+                w13_scale = experts.w13_weight_scale
+                w2 = experts.w2_weight
+                w2_scale = experts.w2_weight_scale
+            except (AttributeError, ImportError, OSError):
+                self._esimd_grouped_weights_ready = False
+                return None
+
+            if (
+                w13.dtype != torch.float8_e4m3fn
+                or w2.dtype != torch.float8_e4m3fn
+                or w13_scale.dtype != torch.float32
+                or w2_scale.dtype != torch.float32
+                or w13_scale.ndim != 1
+                or w2_scale.ndim != 1
+                or w13.ndim != 3
+                or w2.ndim != 3
+                or w13.shape[0] != w2.shape[0]
+                or w13_scale.shape != (w13.shape[0],)
+                or w2_scale.shape != (w2.shape[0],)
+                or not w13.is_contiguous()
+                or not w2.is_contiguous()
+            ):
+                self._esimd_grouped_weights_ready = False
+                return None
+
+            hidden_size = x.shape[-1]
+            is_canonical = (
+                w13.shape[2] == hidden_size
+                and w2.shape[1] == hidden_size
+                and w2.shape[2] == w13.shape[1] // 2
+            )
+            is_native_xpu = (
+                w13.shape[1] == hidden_size
+                and w2.shape[2] == hidden_size
+                and w2.shape[1] == w13.shape[2] // 2
+            )
+            if is_canonical == is_native_xpu:
+                self._esimd_grouped_weights_ready = False
+                return None
+
+            self._esimd_grouped_w13 = w13
+            self._esimd_grouped_w13_scale = w13_scale
+            self._esimd_grouped_w2 = w2
+            self._esimd_grouped_w2_scale = w2_scale
+            self._esimd_grouped_native_layout = is_native_xpu
+            self._esimd_grouped_weights_ready = True
+
+        return (
+            self._esimd_grouped_w13,
+            self._esimd_grouped_w13_scale,
+            self._esimd_grouped_w2,
+            self._esimd_grouped_w2_scale,
+            self._esimd_grouped_native_layout,
+        )
+
+    def _esimd_batch_can_run(self, x: torch.Tensor) -> bool:
+        if (
+            not _MOE_BATCH_GROUPED_ENABLED
+            or x.dtype != torch.float16
+            or x.shape[0] <= 1
+            or not _MOE_GELU_ENABLED
+            or x.shape[0] > _MOE_GROUPED_MAX_M
+            or self._esimd_batch_ready is False
+        ):
+            return False
+
+        try:
+            experts = self.experts.routed_experts
+            if (
+                experts.w13_weight.dtype != torch.float8_e4m3fn
+                or experts.w2_weight.dtype != torch.float8_e4m3fn
+                or experts.w13_weight_scale.ndim != 1
+                or experts.w2_weight_scale.ndim != 1
+            ):
+                return False
+        except (AttributeError, ImportError, OSError):
+            return False
+
+        if self._esimd_batch_ready is None:
+            try:
+                load_esimd_library("moe_ops")
+                load_esimd_library("moe_int4_prefill_ops")
+                self._prod_topk_op = torch.ops.moe_ops.moe_topk
+                self._esimd_batch_gather = (
+                    torch.ops.moe_int4_prefill_ops.moe_prefill_gather_forward_v2
+                )
+                self._esimd_batch_up = torch.ops.moe_ops.moe_up_fp8_grouped
+                self._esimd_batch_down = torch.ops.moe_ops.moe_down_fp8_grouped
+                self._esimd_batch_full = (
+                    torch.ops.moe_ops.moe_forward_full_fp8_grouped
+                )
+                self._esimd_batch_full_native = (
+                    torch.ops.moe_ops.moe_forward_full_fp8_grouped_native
+                )
+            except (AttributeError, ImportError, OSError):
+                self._esimd_batch_ready = False
+                return False
+            else:
+                self._prod_topk_ready = True
+
+        weights = self._get_grouped_moe_weights(x)
+        if weights is None:
+            self._esimd_batch_ready = False
+            logger.warning_once(
+                "Gemma4: grouped ESIMD MoE disabled due to unsupported "
+                "FP8 expert layout or scale shape."
+            )
+            return False
+        w13, _, w2, _, _ = weights
+        return (
+            w13.dtype == torch.float8_e4m3fn
+            and w2.dtype == torch.float8_e4m3fn
+            and w13.shape[0] == self._n_routed_experts
+        )
+
+    def _forward_grouped(
+        self, x: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        weights, indices = self._esimd_routing_fn(
+            x, router_logits, self._top_k, True
+        )
+        weights = weights.to(torch.float16).contiguous()
+        indices = indices.to(torch.int32).contiguous()
+        gathered = self._esimd_batch_gather(
+            indices, self._n_routed_experts
+        )
+        expert_offsets, expert_tokens = gathered[0], gathered[1]
+        moe_weights = self._get_grouped_moe_weights(x)
+        assert moe_weights is not None
+        w13, w13_scale, w2, w2_scale, native_layout = moe_weights
+        if native_layout:
+            out = self._esimd_batch_full_native(
+                x.contiguous(),
+                w13.view(torch.uint8),
+                w13_scale,
+                w2.view(torch.uint8),
+                w2_scale,
+                weights.reshape(-1).contiguous(),
+                expert_offsets,
+                expert_tokens,
+                self._top_k,
+                self._n_routed_experts,
+            )
+        else:
+            intermediate = self._esimd_batch_up(
+                x.contiguous(),
+                w13.view(torch.uint8),
+                w13_scale,
+                expert_offsets,
+                expert_tokens,
+                self._top_k,
+                self._n_routed_experts,
+            )
+            partials = self._esimd_batch_down(
+                intermediate,
+                w2.view(torch.uint8),
+                w2_scale,
+                weights.reshape(-1).contiguous(),
+                expert_offsets,
+                expert_tokens,
+                self._top_k,
+                self._n_routed_experts,
+            )
+            out = partials.view(x.shape[0], self._top_k, -1).sum(1)
+        if get_tensor_model_parallel_world_size() > 1:
+            from vllm.distributed import tensor_model_parallel_all_reduce
+
+            out = tensor_model_parallel_all_reduce(out)
+        return out
+
+    def _get_full_moe_path(
+        self, x: torch.Tensor
+    ) -> tuple[object, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if (
+            x.shape[0] != 1
+            or x.dtype != torch.float16
+            or not _MOE_FULL_FUSED_ENABLED
+            or self._full_moe_ready is False
+        ):
+            return None
+
+        if self._full_moe_ready is None:
+            try:
+                load_esimd_library("moe_ops")
+            except (AttributeError, ImportError, OSError):
+                self._full_moe_ready = False
+                return None
+
+            moe_weights = self._get_grouped_moe_weights(x)
+            if moe_weights is None:
+                self._full_moe_ready = False
+                return None
+            w13, w13_scale, w2, w2_scale, native_layout = moe_weights
+            try:
+                self._full_moe_op = (
+                    torch.ops.moe_ops.moe_forward_full_gelu_tanh_decode_native
+                    if native_layout
+                    else torch.ops.moe_ops.moe_forward_full_gelu_tanh_decode
+                )
+            except AttributeError:
+                self._full_moe_ready = False
+                return None
+            logger.info_once(
+                "Gemma4: enabling full-fused FP8 MoE decode with %s expert layout.",
+                "native XPU" if native_layout else "canonical",
+            )
+            self._full_moe_w13 = w13
+            self._full_moe_w13_scale = w13_scale
+            self._full_moe_w2 = w2
+            self._full_moe_w2_scale = w2_scale
+            self._full_moe_ready = True
+
+        return (
+            self._full_moe_op,
+            self._full_moe_w13,
+            self._full_moe_w13_scale,
+            self._full_moe_w2,
+            self._full_moe_w2_scale,
+        )
+
+    def _get_int4_moe_path(
+        self, x: torch.Tensor
+    ) -> tuple[object, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if (
+            x.dtype != torch.float16
+            or x.shape[0] == 0
+            or x.shape[0]
+            > _GEMMA4_INT4_BATCH_MAX_M
+            or not _GEMMA4_INT4_DECODE_ENABLED
+            or self._n_routed_experts != 128
+            or self._top_k != 8
+            or self._int4_moe_ready is False
+        ):
+            return None
+
+        if self._int4_moe_ready is None:
+            try:
+                routed_experts = self.experts.routed_experts
+                quant_method = routed_experts.quant_method
+                w13 = routed_experts.w13_weight
+                w2 = routed_experts.w2_weight
+            except AttributeError:
+                self._int4_moe_ready = False
+                logger.warning_once(
+                    "Gemma4: INT4 fused MoE is unavailable because the "
+                    "v0.26 RoutedExperts ABI is not initialized."
+                )
+                return None
+
+            if (
+                w13.dtype not in (torch.uint8, torch.int8)
+                or w2.dtype not in (torch.uint8, torch.int8)
+                or w13.ndim != 3
+                or w2.ndim != 3
+                or w13.shape[0] != self._n_routed_experts
+                or w2.shape[0] != self._n_routed_experts
+                or w13.shape[2] * 2 != x.shape[-1]
+                or w2.shape[1] != x.shape[-1]
+                or w2.shape[2] * 2 != w13.shape[1] // 2
+            ):
+                self._int4_moe_ready = False
+                logger.warning_once(
+                    "Gemma4: INT4 fused MoE is unavailable for input shape %s "
+                    "with packed w13 shape %s and w2 shape %s.",
+                    tuple(x.shape),
+                    tuple(w13.shape),
+                    tuple(w2.shape),
+                )
+                return None
+
+            try:
+                load_esimd_library("moe_int4_ops")
+                op = torch.ops.moe_int4_ops.moe_forward_gelu_tanh_int4_decode
+            except (AttributeError, ImportError, OSError):
+                self._int4_moe_ready = False
+                logger.warning_once(
+                    "Gemma4: INT4 fused MoE is unavailable because "
+                    "moe_int4_ops could not be loaded."
+                )
+                return None
+
+            impl = getattr(quant_method, "_xpu_fused_moe_impl", None)
+            if impl is None:
+                return None
+            if not getattr(impl, "is_int4", False):
+                self._int4_moe_ready = False
+                logger.warning_once(
+                    "Gemma4: INT4 fused MoE is unavailable because the XPU "
+                    "MoE implementation did not recognize the packed weights "
+                    "as INT4."
+                )
+                return None
+
+            w13_impl = impl.w13
+            w2_impl = impl.w2
+            w13_scale = impl.gemm1_wei_scales
+            w2_scale = impl.gemm2_wei_scales
+            if (
+                w13_scale is None
+                or w2_scale is None
+                or w13_scale.dtype != torch.float16
+                or w2_scale.dtype != torch.float16
+            ):
+                self._int4_moe_ready = False
+                logger.warning_once(
+                    "Gemma4: INT4 fused MoE is unavailable because its "
+                    "weight scales are not fp16."
+                )
+                return None
+
+            self._int4_moe_op = op
+            self._int4_moe_w13 = w13_impl.view(torch.uint8)
+            self._int4_moe_w13_scale = w13_scale
+            self._int4_moe_w2 = w2_impl.view(torch.uint8)
+            self._int4_moe_w2_scale = w2_scale
+            self._int4_moe_ready = True
+            logger.info_once(
+                "Gemma4: using fused INT4 MoE decode path.",
+                scope="local",
+            )
+
+        return (
+            self._int4_moe_op,
+            self._int4_moe_w13,
+            self._int4_moe_w13_scale,
+            self._int4_moe_w2,
+            self._int4_moe_w2_scale,
+        )
 
     def forward(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        int4_moe = self._get_int4_moe_path(x)
+        if int4_moe is not None:
+            op, w13, w13_scale, w2, w2_scale = int4_moe
+            out = op(
+                x.contiguous(),
+                router_logits.to(torch.float16).contiguous(),
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+                self.per_expert_scale.float().contiguous(),
+                self._top_k,
+                self._n_routed_experts,
+            )
+            if get_tensor_model_parallel_world_size() > 1:
+                from vllm.distributed import tensor_model_parallel_all_reduce
+
+                out = tensor_model_parallel_all_reduce(out)
+            return out
+        full_moe = self._get_full_moe_path(x)
+        if full_moe is not None:
+            op, w13, w13_scale, w2, w2_scale = full_moe
+            out = op(
+                x.contiguous(),
+                router_logits.contiguous(),
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+                self.per_expert_scale.float().contiguous(),
+                self._top_k,
+                self._n_routed_experts,
+            )
+            if get_tensor_model_parallel_world_size() > 1:
+                from vllm.distributed import tensor_model_parallel_all_reduce
+
+                out = tensor_model_parallel_all_reduce(out)
+            return out
+        if self._esimd_batch_can_run(x):
+            return self._forward_grouped(x, router_logits)
         return self.experts(x, router_logits)
 
 
@@ -422,6 +1354,38 @@ class Gemma4Attention(nn.Module):
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+        )
+        self._int4_esimd_enabled = (
+            quant_config is not None
+            and quant_config.get_name() == "sym_int4"
+            and current_platform.is_xpu()
+            and os.environ.get("ENABLE_GEMMA4_INT4_ATTN_ESIMD", "1") == "1"
+            and os.environ.get("DISABLE_GEMMA4_INT4_ATTN_ESIMD", "0") != "1"
+        )
+        self._int4_qkv_ready = None
+        self._int4_o_ready = None
+        self._int4_qkv = None
+        self._int4_o = None
+        self._int4_esimd_batch_enabled = (
+            self._int4_esimd_enabled
+            and os.environ.get("ENABLE_ESIMD_INT4_GEMM", "0") == "1"
+            and os.environ.get("DISABLE_GEMMA4_INT4_BATCH_ESIMD", "1") != "1"
+        )
+        self._int4_esimd_batch_max_bsz = int(
+            os.environ.get("MAX_DECODE_BSZ", "64")
+        )
+        _fp8_qkv_opt_in = os.environ.get("ENABLE_ESIMD_QKV_PROJ", "0") == "1"
+        self._fp8_qkv_esimd_enabled = (
+            quant_config is not None
+            and quant_config.get_name() == "fp8"
+            and current_platform.is_xpu()
+            and os.environ.get("DISABLE_GEMMA4_FP8_QKV_ESIMD", "0") != "1"
+        )
+        self._fp8_qkv_esimd_ready = None
+        self._fp8_qkv_esimd_op = None
+        self._fp8_qkv_min_bsz = 1 if _fp8_qkv_opt_in else 2
+        self._fp8_qkv_max_bsz = int(
+            os.environ.get("MAX_DECODE_BSZ", "64" if _fp8_qkv_opt_in else "4")
         )
 
         # Q/K norms: output = norm(x) * weight (learnable per-head scale)
@@ -509,6 +1473,137 @@ class Gemma4Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        self._esimd_qkv_fused_enabled = (
+            quant_config is not None
+            and quant_config.get_name() in ("fp8", "sym_int4")
+            and current_platform.is_xpu()
+            and self.head_dim == 256
+            and not self.is_kv_shared_layer
+            and os.environ.get("ENABLE_ESIMD_QKV_FUSED", "1") != "0"
+            and os.environ.get("DISABLE_ESIMD_QKV_FUSED", "0") != "1"
+        )
+        self._esimd_qkv_fused_max_bsz = int(
+            os.environ.get("MAX_DECODE_BSZ", "64")
+        )
+        self._esimd_qkv_fused_ready = None
+        self._esimd_qkv_fused_op = None
+        self._esimd_qkv_fused_cache: dict[str, torch.Tensor] | None = None
+
+    def _probe_fp8_qkv_esimd(self) -> bool:
+        try:
+            weight = self.qkv_proj.weight
+            scale = self.qkv_proj.weight_scale
+            op = get_esimd_op("esimd_gemm_fp8_pert")
+        except (AttributeError, ImportError, OSError):
+            return False
+
+        if (
+            weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+            or weight.ndim != 2
+            or not weight.is_contiguous()
+            or scale.dtype != torch.float32
+            or scale.numel() != 1
+            or not scale.is_contiguous()
+        ):
+            return False
+
+        self._fp8_qkv_esimd_op = op
+        self._fp8_qkv_weight = weight
+        self._fp8_qkv_scale = scale
+        self._fp8_qkv_out = torch.empty(
+            self._fp8_qkv_max_bsz,
+            weight.shape[0],
+            dtype=torch.float16,
+            device=weight.device,
+        )
+        return True
+
+    def _try_int4_projection(
+        self,
+        x: torch.Tensor,
+        projection: nn.Module,
+        buffer_name: str,
+        ready_name: str,
+        expected_output_size: int,
+    ) -> torch.Tensor | None:
+        if (
+            not self._int4_esimd_enabled
+            or x.shape[0] == 0
+            or x.dtype != torch.float16
+            or not x.is_contiguous()
+            or getattr(projection, "bias", None) is not None
+            or getattr(self, ready_name) is False
+        ):
+            return None
+        if (
+            x.shape[0] > 1
+            and (
+                not self._int4_esimd_batch_enabled
+                or x.shape[0] > self._int4_esimd_batch_max_bsz
+            )
+        ):
+            return None
+
+        try:
+            weight = projection.weight_esimd
+            scale = projection.scale_esimd
+        except (AttributeError, ImportError, OSError):
+            setattr(self, ready_name, False)
+            return None
+
+        if weight.shape[0] != expected_output_size:
+            return None
+        input_padded = _pad_int4_input(x, weight)
+        if input_padded is None:
+            return None
+
+        output = getattr(self, buffer_name)
+        if x.shape[0] > 1:
+            try:
+                from vllm.model_executor.layers.quantization._sym_int4_esimd import (
+                    try_esimd_int4_linear,
+                )
+            except ImportError:
+                setattr(self, ready_name, False)
+                return None
+            # Keep each queued M>1 projection independent from later steps.
+            output = torch.empty(
+                (x.shape[0], expected_output_size),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            if (
+                try_esimd_int4_linear(
+                    input_padded,
+                    weight,
+                    scale,
+                    output=output,
+                )
+                is None
+            ):
+                return None
+            setattr(self, ready_name, True)
+            return output
+
+        try:
+            op = get_esimd_op("esimd_gemv_int4")
+        except (AttributeError, ImportError, OSError):
+            setattr(self, ready_name, False)
+            return None
+        if output is None or output.shape != (1, expected_output_size):
+            output = torch.empty(
+                (1, expected_output_size), dtype=torch.float16, device=x.device
+            )
+            setattr(self, buffer_name, output)
+        op(input_padded, weight, scale, output)
+        setattr(self, ready_name, True)
+        logger.info_once(
+            "Gemma4: using INT4 ESIMD projection %s.",
+            buffer_name,
+            scope="local",
+        )
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -518,30 +1613,155 @@ class Gemma4Attention(nn.Module):
         # Unified QKV path (works for both k_eq_v and standard layers).
         # For k_eq_v, K weights are loaded into both K and V slots of
         # qkv_proj, so V == K automatically.
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        qkv = None
+        if self._fp8_qkv_esimd_enabled:
+            n_tokens = hidden_states.shape[0]
+            if self._fp8_qkv_min_bsz <= n_tokens <= self._fp8_qkv_max_bsz:
+                if self._fp8_qkv_esimd_ready is None:
+                    self._fp8_qkv_esimd_ready = self._probe_fp8_qkv_esimd()
+                if (
+                    self._fp8_qkv_esimd_ready
+                    and hidden_states.dtype == torch.float16
+                    and hidden_states.is_contiguous()
+                    and hidden_states.shape[-1] == self._fp8_qkv_weight.shape[1]
+                ):
+                    qkv = self._fp8_qkv_out[:n_tokens]
+                    self._fp8_qkv_esimd_op(
+                        hidden_states,
+                        self._fp8_qkv_weight,
+                        self._fp8_qkv_scale,
+                        qkv,
+                    )
+        if qkv is None:
+            qkv = self._try_int4_projection(
+                hidden_states,
+                self.qkv_proj,
+                "_int4_qkv",
+                "_int4_qkv_ready",
+                self.q_size + 2 * self.kv_size,
+            )
+        if qkv is None:
+            qkv, _ = self.qkv_proj(hidden_states)
+        fused_qkv = (
+            self._esimd_qkv_fused_enabled
+            and qkv.dtype == torch.float16
+            and qkv.shape[-1] == self.q_size + 2 * self.kv_size
+            and 1 <= qkv.shape[0] <= self._esimd_qkv_fused_max_bsz
+        )
+        if fused_qkv and self._esimd_qkv_fused_ready is None:
+            self._esimd_qkv_fused_op = _get_optional_esimd_op(
+                "esimd_qkv_split_norm_rope_v"
+            )
+            self._esimd_qkv_fused_ready = self._esimd_qkv_fused_op is not None
+            if self._esimd_qkv_fused_ready:
+                logger.info_once(
+                    "Gemma4: using fused ESIMD QKV split/norm/RoPE.",
+                    scope="local",
+                )
+        fused_qkv = fused_qkv and self._esimd_qkv_fused_ready
 
-        # Q norm (always applied)
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = self.q_norm(q)
-        q = q.flatten(-2, -1)
-
-        if not self.is_kv_shared_layer:
-            # Non-shared: apply K norm + RoPE, V norm
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-            k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
-
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
+        if fused_qkv:
+            op = self._esimd_qkv_fused_op
+            assert op is not None
+            n_tokens = qkv.shape[0]
+            cache = self._esimd_qkv_fused_cache
+            if cache is None or cache["wq"].device != qkv.device:
+                cache = {
+                    # The kernel uses the Qwen convention (weight + 1).
+                    # Gemma4 RMSNorm stores the final multiplier directly.
+                    "wq": (self.q_norm.weight.detach() - 1.0).contiguous(),
+                    "wk": (self.k_norm.weight.detach() - 1.0).contiguous(),
+                    # Gemma4 V-Norm has no learned weight, so zero + 1 is
+                    # the required unit multiplier in the kernel.
+                    "wv": torch.zeros(
+                        self.head_dim, dtype=torch.float16, device=qkv.device
+                    ),
+                    "gate": torch.empty(
+                        1, self.q_size, dtype=torch.float16, device=qkv.device
+                    ),
+                    "q": torch.empty(
+                        self._esimd_qkv_fused_max_bsz,
+                        self.q_size,
+                        dtype=torch.float16,
+                        device=qkv.device,
+                    ),
+                    "k": torch.empty(
+                        self._esimd_qkv_fused_max_bsz,
+                        self.kv_size,
+                        dtype=torch.float16,
+                        device=qkv.device,
+                    ),
+                    "v": torch.empty(
+                        self._esimd_qkv_fused_max_bsz,
+                        self.kv_size,
+                        dtype=torch.float16,
+                        device=qkv.device,
+                    ),
+                }
+                self._esimd_qkv_fused_cache = cache
+            q = cache["q"][:n_tokens]
+            k = cache["k"][:n_tokens]
+            v = cache["v"][:n_tokens]
+            # The kernel consumes int32 position values.  For decode there is
+            # one position, so avoid a redundant cast when the scheduler
+            # already supplied the required dtype.
+            qkv_positions = (
+                positions
+                if n_tokens == 1 and positions.dtype == torch.int32
+                else positions.to(dtype=torch.int32)
+            )
+            op(
+                qkv.contiguous(),
+                q,
+                cache["gate"],
+                k,
+                v,
+                cache["wq"],
+                cache["wk"],
+                cache["wv"],
+                qkv_positions,
+                self.num_heads,
+                self.num_kv_heads,
+                False,
+                self.head_dim,
+                self.rotary_emb._match_cos_sin_cache_dtype(qkv),
+            )
         else:
-            # Shared: only apply RoPE to Q
-            q = self.rotary_emb(positions, q, k)[0]
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+            # Q norm (always applied)
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            q = self.q_norm(q)
+            q = q.flatten(-2, -1)
+
+            if not self.is_kv_shared_layer:
+                # Non-shared: apply K norm + RoPE, V norm
+                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                k = self.k_norm(k)
+                k = k.flatten(-2, -1)
+                q, k = self.rotary_emb(positions, q, k)
+
+                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(v)
+                v = v.flatten(-2, -1)
+            else:
+                # Shared: only apply RoPE to Q
+                q = self.rotary_emb(positions, q, k)[0]
 
         attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        output = self._try_int4_projection(
+            attn_output,
+            self.o_proj,
+            "_int4_o",
+            "_int4_o_ready",
+            self.hidden_size,
+        )
+        if output is None:
+            output, _ = self.o_proj(attn_output)
+        elif get_tensor_model_parallel_world_size() > 1:
+            from vllm.distributed import tensor_model_parallel_all_reduce
+
+            output = tensor_model_parallel_all_reduce(output)
 
         return output
 
@@ -699,6 +1919,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Layer scalar (loaded from checkpoint) — applies to ALL text layers
         self.register_buffer("layer_scalar", torch.ones(1))
+        self._layer_scalar_host: float | None = None
 
     def forward(
         self,
@@ -711,9 +1932,41 @@ class Gemma4DecoderLayer(nn.Module):
         # Gemma4 residual pattern:
         # 1. input_norm(x) → attn → post_attn_norm → ADD residual
         # 2. pre_ff_norm → mlp → post_ff_norm → ADD residual
-        residual = hidden_states
+        prev_scalar = kwargs.pop("prev_layer_scalar", None)
+        xfuse = (
+            _ESIMD_NORM_ENABLED
+            and per_layer_input is None
+            and self.per_layer_input_gate is None
+            and hidden_states.shape[0] == 1
+            and hidden_states.is_contiguous()
+            and residual is not None
+            and residual.is_contiguous()
+            and hidden_states.dtype == torch.float16
+            and self.input_layernorm.weight.dtype == torch.float16
+            and prev_scalar is not None
+            and _GEMMA4_XFUSE_ENABLED
+        )
+        if xfuse:
+            op = _get_optional_esimd_op("esimd_fused_scaled_add_rms_norm")
+            xfuse = op is not None
 
-        hidden_states = self.input_layernorm(residual)
+        if xfuse:
+            assert residual is not None
+            assert prev_scalar is not None
+            op(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight.detach(),
+                self.input_layernorm.variance_epsilon,
+                prev_scalar,
+            )
+        else:
+            # A preceding layer may have deferred its scalar and final add
+            # for this layer's input norm. Materialize it before falling back.
+            if residual is not None and prev_scalar is not None:
+                hidden_states = (hidden_states + residual) * prev_scalar
+            residual = hidden_states
+            hidden_states = self.input_layernorm(residual)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -721,27 +1974,211 @@ class Gemma4DecoderLayer(nn.Module):
             **kwargs,
         )
 
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-        residual = hidden_states
+        fused_attn_out = (
+            _ESIMD_NORM_ENABLED
+            and hidden_states.shape[0] == 1
+            and hidden_states.is_contiguous()
+            and residual is not None
+            and residual.is_contiguous()
+            and hidden_states.dtype == torch.float16
+            and self.post_attention_layernorm.weight.dtype == torch.float16
+            and self.pre_feedforward_layernorm.weight.dtype == torch.float16
+            and _GEMMA4_FUSED_ATTN_OUT_ENABLED
+        )
+        if fused_attn_out:
+            op = _get_optional_esimd_op("esimd_norm_add_norm")
+            fused_attn_out = op is not None
+
+        if fused_attn_out:
+            assert residual is not None
+            output = getattr(self, "_fused_attn_out_buf", None)
+            if (
+                output is None
+                or output.shape != hidden_states.shape
+                or output.device != hidden_states.device
+            ):
+                output = torch.empty_like(hidden_states)
+                self._fused_attn_out_buf = output
+            op(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight.detach(),
+                self.pre_feedforward_layernorm.weight.detach(),
+                output,
+                self.post_attention_layernorm.variance_epsilon,
+                self.pre_feedforward_layernorm.variance_epsilon,
+            )
+            hidden_states = output
+        else:
+            hidden_states = _esimd_rms_norm_or_fallback(
+                self.post_attention_layernorm, hidden_states
+            )
+            fused_pre_ff = (
+                _ESIMD_NORM_ENABLED
+                and hidden_states.shape[0] == 1
+                and hidden_states.is_contiguous()
+                and residual is not None
+                and residual.is_contiguous()
+                and hidden_states.dtype == torch.float16
+                and self.pre_feedforward_layernorm.weight.dtype == torch.float16
+                and _GEMMA4_FUSED_PRE_FF_ENABLED
+            )
+            if fused_pre_ff:
+                op = _get_optional_esimd_op("esimd_fused_add_rms_norm")
+                fused_pre_ff = op is not None
+            if fused_pre_ff:
+                assert residual is not None
+                op(
+                    hidden_states,
+                    residual,
+                    self.pre_feedforward_layernorm.weight.detach(),
+                    self.pre_feedforward_layernorm.variance_epsilon,
+                )
+            else:
+                hidden_states = hidden_states + residual
+                residual = hidden_states
+                hidden_states = self.pre_feedforward_layernorm(hidden_states)
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
         if self.enable_moe_block:
-            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+            hidden_states_1 = _esimd_rms_norm_or_fallback(
+                self.post_feedforward_layernorm_1, hidden_states
+            )
 
-            hidden_states_2 = self.pre_feedforward_layernorm_2(residual)
-            router_logits = self.router(residual)
+            router = self.router
+            fused_router = (
+                _ESIMD_NORM_ENABLED
+                and residual is not None
+                and residual.shape[0] == 1
+                and residual.is_contiguous()
+                and residual.dtype == torch.float16
+                and router is not None
+                and router.proj.weight.dtype == torch.float16
+                and router.proj.weight.is_contiguous()
+                and self.pre_feedforward_layernorm_2.weight.dtype
+                == torch.float16
+                and _GEMMA4_FUSED_ROUTER_ENABLED
+            )
+            if fused_router:
+                op = _get_optional_esimd_op("esimd_norm_gemv_norm_fp16")
+                fused_router = op is not None
+            if fused_router:
+                assert residual is not None
+                assert router is not None
+                scale_with_root = getattr(router, "_scale_with_root", None)
+                if (
+                    scale_with_root is None
+                    or scale_with_root.device != residual.device
+                ):
+                    scale_with_root = (
+                        router.scale.detach() * router.root_size
+                    ).to(residual.dtype).contiguous()
+                    router._scale_with_root = scale_with_root
+                router_logits = getattr(router, "_router_logits_buf", None)
+                if (
+                    router_logits is None
+                    or router_logits.shape != (1, router.proj.weight.shape[0])
+                    or router_logits.device != residual.device
+                ):
+                    router_logits = torch.empty(
+                        1,
+                        router.proj.weight.shape[0],
+                        dtype=torch.float16,
+                        device=residual.device,
+                    )
+                    router._router_logits_buf = router_logits
+                moe_input = getattr(self, "_moe_input_buf", None)
+                if (
+                    moe_input is None
+                    or moe_input.shape != residual.shape
+                    or moe_input.device != residual.device
+                ):
+                    moe_input = torch.empty_like(residual)
+                    self._moe_input_buf = moe_input
+                op(
+                    residual,
+                    scale_with_root,
+                    router.proj.weight,
+                    self.pre_feedforward_layernorm_2.weight.detach(),
+                    router_logits,
+                    moe_input,
+                    self.pre_feedforward_layernorm_2.variance_epsilon,
+                )
+                hidden_states_2 = moe_input
+            else:
+                assert residual is not None
+                hidden_states_2 = _esimd_rms_norm_or_fallback(
+                    self.pre_feedforward_layernorm_2, residual
+                )
+                router_logits = router(residual)
             hidden_states_2 = self.moe(hidden_states_2, router_logits)
-            hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
-
-            # Combine MLP and MoE outputs
-            hidden_states = hidden_states_1 + hidden_states_2
-
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
+            fused_h2 = (
+                _ESIMD_NORM_ENABLED
+                and hidden_states_2.shape[0] == 1
+                and hidden_states_1.is_contiguous()
+                and hidden_states_2.is_contiguous()
+                and hidden_states_2.dtype == torch.float16
+                and self.post_feedforward_layernorm_2.weight.dtype
+                == torch.float16
+                and self.post_feedforward_layernorm.weight.dtype == torch.float16
+                and _GEMMA4_FUSED_H2_ENABLED
+            )
+            if fused_h2:
+                op = _get_optional_esimd_op("esimd_norm_add_norm")
+                fused_h2 = op is not None
+            if fused_h2:
+                output = getattr(self, "_fused_h2_out_buf", None)
+                if (
+                    output is None
+                    or output.shape != hidden_states_2.shape
+                    or output.device != hidden_states_2.device
+                ):
+                    output = torch.empty_like(hidden_states_2)
+                    self._fused_h2_out_buf = output
+                op(
+                    hidden_states_2,
+                    hidden_states_1,
+                    self.post_feedforward_layernorm_2.weight.detach(),
+                    self.post_feedforward_layernorm.weight.detach(),
+                    output,
+                    self.post_feedforward_layernorm_2.variance_epsilon,
+                    self.post_feedforward_layernorm.variance_epsilon,
+                )
+                hidden_states = output
+            else:
+                hidden_states_2 = _esimd_rms_norm_or_fallback(
+                    self.post_feedforward_layernorm_2, hidden_states_2
+                )
+                fused_h2_add = (
+                    _ESIMD_NORM_ENABLED
+                    and hidden_states_2.shape[0] == 1
+                    and hidden_states_1.is_contiguous()
+                    and hidden_states_2.is_contiguous()
+                    and hidden_states_2.dtype == torch.float16
+                    and self.post_feedforward_layernorm.weight.dtype
+                    == torch.float16
+                    and _GEMMA4_FUSED_H2_ADD_ENABLED
+                )
+                if fused_h2_add:
+                    op = _get_optional_esimd_op("esimd_fused_add_rms_norm")
+                    fused_h2_add = op is not None
+                if fused_h2_add:
+                    op(
+                        hidden_states_2,
+                        hidden_states_1,
+                        self.post_feedforward_layernorm.weight.detach(),
+                        self.post_feedforward_layernorm.variance_epsilon,
+                    )
+                    hidden_states = hidden_states_2
+                else:
+                    hidden_states = hidden_states_1 + hidden_states_2
+                    hidden_states = self.post_feedforward_layernorm(hidden_states)
+        else:
+            hidden_states = _esimd_rms_norm_or_fallback(
+                self.post_feedforward_layernorm, hidden_states
+            )
 
         # Apply PLE (Per-Layer Embedding) if configured
         if per_layer_input is not None and self.per_layer_input_gate is not None:
@@ -754,8 +2191,23 @@ class Gemma4DecoderLayer(nn.Module):
             )
             hidden_states = hidden_states + per_layer_contribution
 
-        # Apply layer scalar for full-attention layers
-        # Apply per-layer scalar (all text layers)
+        defer_output = (
+            _ESIMD_NORM_ENABLED
+            and per_layer_input is None
+            and self.per_layer_input_gate is None
+            and hidden_states.shape[0] == 1
+            and hidden_states.is_contiguous()
+            and residual is not None
+            and residual.is_contiguous()
+            and hidden_states.dtype == torch.float16
+            and _GEMMA4_XFUSE_ENABLED
+        )
+        if defer_output:
+            # Defer this layer's final add and scalar so the next layer can
+            # combine it with its input RMSNorm in one launch.
+            return hidden_states, residual
+
+        hidden_states = hidden_states + residual
         hidden_states = hidden_states * self.layer_scalar
 
         return hidden_states, None
@@ -771,6 +2223,7 @@ def _run_decoder_layers(
 ) -> torch.Tensor:
     """Run a slice of decoder layers with PLE extraction."""
     residual = None
+    prev_layer_scalar = None
     for idx, layer in enumerate(decoder_layers):
         layer_idx = idx + layer_idx_start
         layer_per_input = (
@@ -781,8 +2234,14 @@ def _run_decoder_layers(
             hidden_states,
             residual,
             per_layer_input=layer_per_input,
+            prev_layer_scalar=prev_layer_scalar,
             **kwargs,
         )
+        if layer._layer_scalar_host is None:
+            layer._layer_scalar_host = float(layer.layer_scalar.item())
+        prev_layer_scalar = layer._layer_scalar_host
+    if residual is not None and prev_layer_scalar is not None:
+        hidden_states = (hidden_states + residual) * prev_layer_scalar
     return hidden_states
 
 
@@ -1323,6 +2782,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
             if per_layer_inputs is not None:
                 per_layer_inputs = intermediate_tensors["per_layer_inputs"]
         residual = None
+        prev_layer_scalar = None
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
@@ -1340,12 +2800,18 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                 hidden_states,
                 residual,
                 per_layer_input=layer_per_input,
+                prev_layer_scalar=prev_layer_scalar,
                 **kwargs,
             )
+            if layer._layer_scalar_host is None:
+                layer._layer_scalar_host = float(layer.layer_scalar.item())
+            prev_layer_scalar = layer._layer_scalar_host
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
         if not get_pp_group().is_last_rank:
+            if residual is not None and prev_layer_scalar is not None:
+                hidden_states = (hidden_states + residual) * prev_layer_scalar
             tensors: dict[str, torch.Tensor] = {
                 "hidden_states": hidden_states,
             }
@@ -1357,7 +2823,9 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         if residual is None:
             hidden_states = self.norm(hidden_states)
         else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            assert prev_layer_scalar is not None
+            hidden_states = (hidden_states + residual) * prev_layer_scalar
+            hidden_states = self.norm(hidden_states)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -1508,7 +2976,12 @@ class Gemma4Model(nn.Module, EagleModelMixin):
 class Gemma4ForCausalLM(
     nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts, SupportsEagle3
 ):
+    is_3d_moe_weight = True
+
     hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_regex={
+            GEMMA4_MOE_LORA_EXPERTS_PATTERN: ".moe.experts",
+        },
         orig_to_new_prefix={
             # Gemma4ForConditionalGeneration already loads the text stack
             # from `model.language_model.*`. We reuse that same checkpoint
@@ -1615,6 +3088,16 @@ class Gemma4ForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Checkpoint weight names use "language_model." prefix (from the

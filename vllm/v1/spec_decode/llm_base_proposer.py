@@ -128,6 +128,9 @@ class SpecDecodeBaseProposer:
         self.use_local_argmax_reduction: bool = (
             self.speculative_config.use_local_argmax_reduction
         )
+        self._use_qwen_spec_local_argmax = (
+            self.speculative_config.use_qwen_mtp_or_dflash()
+        )
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
 
         self.use_heterogeneous_vocab: bool = (
@@ -427,7 +430,9 @@ class SpecDecodeBaseProposer:
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
-        if self.use_local_argmax_reduction:
+        if self.use_local_argmax_reduction and (
+            hidden_states.shape[0] > 1 or not self._use_qwen_spec_local_argmax
+        ):
             return self.model.get_top_tokens(hidden_states)
         if self.use_heterogeneous_vocab:
             logits = self.model.compute_logits(hidden_states)
@@ -709,26 +714,44 @@ class SpecDecodeBaseProposer:
                     )
                 )
 
-            # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
-            self.hidden_states[:batch_size] = hidden_states
-            if self.supports_mm_inputs:
-                self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
-
-                input_ids = None
-                inputs_embeds = self.inputs_embeds[:input_batch_size]
-            else:
-                input_ids = self.input_ids[:input_batch_size]
+            # Cudagraphs require stable input-buffer addresses. In eager MTP,
+            # passing the freshly-produced tensors directly avoids two device
+            # copies and their launch gaps on every extra draft step.
+            direct_eager_inputs = (
+                self.method == "mtp"
+                and cudagraph_runtime_mode == CUDAGraphMode.NONE
+                and input_batch_size == batch_size
+                and not self.supports_mm_inputs
+            )
+            if direct_eager_inputs:
+                model_input_ids = input_ids
+                model_hidden_states = hidden_states
+                model_input_tokens = batch_size
                 inputs_embeds = None
+            else:
+                self.input_ids[:batch_size] = input_ids
+                self.hidden_states[:batch_size] = hidden_states
+                if self.supports_mm_inputs:
+                    self.inputs_embeds[:batch_size] = self.model.embed_input_ids(
+                        input_ids
+                    )
+
+                    model_input_ids = None
+                    inputs_embeds = self.inputs_embeds[:input_batch_size]
+                else:
+                    model_input_ids = self.input_ids[:input_batch_size]
+                    inputs_embeds = None
+                model_hidden_states = self.hidden_states[:input_batch_size]
+                model_input_tokens = input_batch_size
 
             # Run the model.
             model_kwargs = {
-                "input_ids": input_ids,
-                "positions": self._get_positions(input_batch_size),
+                "input_ids": model_input_ids,
+                "positions": self._get_positions(model_input_tokens),
                 "inputs_embeds": inputs_embeds,
             }
             if self.pass_hidden_states_to_model:
-                model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+                model_kwargs["hidden_states"] = model_hidden_states
 
             if self.eplb_state is not None:
                 self.eplb_state.prepare_forward(
@@ -739,10 +762,10 @@ class SpecDecodeBaseProposer:
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=input_batch_size,
+                num_tokens=model_input_tokens,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping(input_batch_size),
+                slot_mapping=self._get_slot_mapping(model_input_tokens),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():

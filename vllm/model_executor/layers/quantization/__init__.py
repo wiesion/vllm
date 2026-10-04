@@ -23,6 +23,7 @@ QuantizationMethods = Literal[
     "gptq",
     "gptq_marlin",
     "awq_marlin",
+    "sym_int4",
     "humming",
     "compressed-tensors",
     "bitsandbytes",
@@ -136,6 +137,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .moe_wna16 import MoeWNA16Config
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
     from .online.base import OnlineQuantizationConfig
+    from .sym_int4 import SymInt4Config
     from .torchao import TorchAOConfig
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
@@ -152,6 +154,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "auto_gptq": AutoGPTQConfig,
         "gptq": AutoGPTQConfig,
         "gptq_marlin": AutoGPTQConfig,
+        "sym_int4": SymInt4Config,
         "compressed-tensors": CompressedTensorsConfig,
         "bitsandbytes": BitsAndBytesConfig,
         "experts_int8": ExpertsInt8Config,

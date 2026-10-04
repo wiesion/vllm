@@ -3,6 +3,7 @@
 """Custom activation functions."""
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -425,6 +426,33 @@ class GeluAndMul(CustomOp):
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self.approximate == "tanh"
+            and x.dtype == torch.float16
+            and x.is_contiguous()
+        ):
+            d = x.shape[-1] // 2
+            if (
+                d % 64 == 0
+                and d <= 4096
+                and os.environ.get("DISABLE_GEMMA4_GELU_ESIMD", "0") != "1"
+            ):
+                try:
+                    from custom_esimd_kernels_vllm import (
+                        esimd_moe_gelu_tanh_mul,
+                    )
+                except (ImportError, OSError):
+                    pass
+                else:
+                    output_shape = x.shape[:-1] + (d,)
+                    out = torch.empty(
+                        output_shape, dtype=x.dtype, device=x.device
+                    )
+                    n_rows = x.numel() // x.shape[-1]
+                    esimd_moe_gelu_tanh_mul(
+                        x, out, x.shape[-1], d, n_rows
+                    )
+                    return out
         return self.forward_cuda(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:

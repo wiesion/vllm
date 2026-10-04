@@ -93,6 +93,10 @@ def get_mem_info_wrapper(
 
     # Call the underlying C++ implementation
     free, total = torch.ops._C_cache_ops.getMemoryInfo(device)
+    if free == 0:
+        native_free, native_total = torch.xpu.mem_get_info(device)
+        if native_free > 0:
+            free, total = native_free, native_total
 
     return free, total
 
@@ -341,7 +345,6 @@ class XPUPlatform(Platform):
         from vllm.model_executor.layers.attention_layer_base import (
             AttentionLayerBase,
         )
-        from vllm.utils.math_utils import cdiv
 
         cache_config = vllm_config.cache_config
         # special fix for GDN since kernel only supports block size dividable by 64
@@ -359,9 +362,15 @@ class XPUPlatform(Platform):
 
         if kernel_block_size is None:
             return
-        new_block_size = (
-            cdiv(cache_config.block_size, kernel_block_size) * kernel_block_size
-        )
+        # Round up to a power of 2 (which is always a multiple of 64 once >= 64).
+        # The ESIMD paged-attention decode kernel asserts isPowerOf2(pageSize);
+        # the hybrid mamba-page negotiation otherwise yields e.g. 576 (=64*9),
+        # a multiple of 64 but not a power of 2, which silently disables that
+        # kernel's fast path (falls back to the slower CUTLASS decode kernel).
+        # Powers of 2 satisfy both the GDN ">= 64 and divisible-by-64" need and
+        # the PA power-of-2 need.
+        bs = max(cache_config.block_size, kernel_block_size)
+        new_block_size = 1 << (bs - 1).bit_length()  # next power of 2 >= bs
         if new_block_size == cache_config.block_size:
             return
 
@@ -493,4 +502,4 @@ class XPUPlatform(Platform):
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
-        return True
+        return os.environ.get("VLLM_XPU_USE_CUSTOM_OP_COLLECTIVES", "1") != "0"

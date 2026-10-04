@@ -36,7 +36,11 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     prepare_communication_buffer_for_model,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -116,6 +120,27 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
+
+_QWEN3_NEXT_PLAIN_MROPE = "_qwen3_next_plain_mrope"
+
+
+def _set_qwen3_next_plain_mrope_context(
+    *,
+    enabled: bool,
+    uses_mrope: bool,
+    cudagraph_mode: CUDAGraphMode,
+    input_batch: InputBatch,
+) -> None:
+    """Enable plain RoPE only when every scheduled token is in decode."""
+    eligible = (
+        enabled
+        and uses_mrope
+        and cudagraph_mode == CUDAGraphMode.NONE
+        and input_batch.num_tokens == input_batch.num_tokens_after_padding
+        and 1 <= input_batch.num_tokens <= 64
+        and not np.any(input_batch.is_prefilling_np)
+    )
+    get_forward_context().additional_kwargs[_QWEN3_NEXT_PLAIN_MROPE] = eligible
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1347,6 +1372,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
             ):
+                _set_qwen3_next_plain_mrope_context(
+                    enabled=(
+                        self.speculative_config is not None
+                        and self.speculative_config.use_qwen_mtp_or_dflash()
+                    ),
+                    uses_mrope=self.model_config.uses_mrope and not dummy_run,
+                    cudagraph_mode=batch_desc.cg_mode,
+                    input_batch=input_batch,
+                )
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable

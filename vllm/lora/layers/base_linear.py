@@ -104,6 +104,8 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         model_config: PretrainedConfig | None = None,
     ) -> None:
         self.lora_config = lora_config
+        self.adapter_enabled_cpu = [False] * max_loras
+        self.adapter_ranks_cpu = [0] * max_loras
         if isinstance(self.base_layer, ReplicatedLinear):
             lora_a_out_size = lora_config.max_lora_rank
             lora_b_out_size = self.output_size
@@ -154,6 +156,8 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         for s_index in range(self.n_slices):
             self.lora_a_stacked[s_index][index] = 0
             self.lora_b_stacked[s_index][index] = 0
+        self.adapter_enabled_cpu[index] = False
+        self.adapter_ranks_cpu[index] = 0
 
     def set_lora(
         self,
@@ -182,6 +186,8 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         self.lora_b_stacked[0][index, 0, : lora_b.shape[0], : lora_b.shape[1]].copy_(
             lora_b, non_blocking=True
         )
+        self.adapter_enabled_cpu[index] = True
+        self.adapter_ranks_cpu[index] = lora_a.shape[0]
 
     def _get_quant_method(self) -> QuantizeMethodBase:
         quant_method = self.base_layer.quant_method
@@ -215,6 +221,9 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
     def _apply_lora_to_output(
         self, x: torch.Tensor, output: torch.Tensor
     ) -> torch.Tensor:
+        if not self.is_lora_active():
+            return output
+
         original_shape = output.shape if output.ndim == 3 else None
 
         # In transformers backend, x and output have extra batch dimension like
@@ -225,7 +234,16 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             x = x.flatten(0, 1)
 
         lora_output: torch.Tensor | None = self.punica_wrapper.add_lora_linear(
-            output, x, self.lora_a_stacked, self.lora_b_stacked, 1.0, self.output_slices
+            output,
+            x,
+            self.lora_a_stacked,
+            self.lora_b_stacked,
+            1.0,
+            self.output_slices,
+            adapter_enabled_cpu=self.adapter_enabled_cpu,
+            adapter_ranks_cpu=(
+                None if self.lora_config.fully_sharded_loras else self.adapter_ranks_cpu
+            ),
         )
         if not current_platform.can_update_inplace():
             output = lora_output
@@ -274,6 +292,12 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
                 1.0,
                 self.output_slices,
                 add_inputs=False,
+                adapter_enabled_cpu=self.adapter_enabled_cpu,
+                adapter_ranks_cpu=(
+                    None
+                    if self.lora_config.fully_sharded_loras
+                    else self.adapter_ranks_cpu
+                ),
             )
             return lora_output
 

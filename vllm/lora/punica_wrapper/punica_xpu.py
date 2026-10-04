@@ -13,7 +13,13 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.lora.layers import LoRAMapping
-from vllm.lora.ops.xpu_ops import bgmv_expand, bgmv_expand_slice, bgmv_shrink
+from vllm.lora.ops.xpu_ops import (
+    bgmv_expand,
+    bgmv_expand_slice,
+    bgmv_linear,
+    bgmv_shrink,
+    has_fused_lora_linear,
+)
 from vllm.lora.utils import get_captured_lora_counts
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.math_utils import round_up
@@ -25,6 +31,8 @@ if HAS_TRITON:
     )
 
 from .punica_base import PunicaWrapperBase
+
+_SINGLE_LORA_GEMM_MIN_WORK = 30_000_000
 
 
 @final
@@ -49,6 +57,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
 
         self.lora_config = kwargs["lora_config"]
         self.max_loras = self.lora_config.max_loras
+        self.active_lora_indices: tuple[int, ...] = ()
+        self.single_lora_index: int | None = None
 
         # Compute captured LoRA counts for cudagraph specialization.
         captured_lora_counts = get_captured_lora_counts(
@@ -82,6 +92,23 @@ class PunicaWrapperXPU(PunicaWrapperBase):
         **kwargs,
     ):
         self.is_prefill = mapping.is_prefill
+        self.no_lora = not any(lora_id > 0 for lora_id in mapping.index_mapping)
+        active_lora_ids = {lora_id for lora_id in mapping.index_mapping if lora_id > 0}
+        self.active_lora_indices = tuple(
+            index
+            for index, lora_id in enumerate(lora_index_to_id)
+            if lora_id in active_lora_ids
+        )
+        self.single_lora_index = (
+            self.active_lora_indices[0]
+            if len(self.active_lora_indices) == 1
+            and all(lora_id > 0 for lora_id in mapping.index_mapping)
+            else None
+        )
+
+        if self.no_lora and not getattr(self.lora_config, "fully_sharded_loras", False):
+            return
+
         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
 
         # Prepare kernel metadata tensors
@@ -91,6 +118,32 @@ class PunicaWrapperXPU(PunicaWrapperBase):
     def _get_token_lora_indices(self, x: torch.Tensor) -> torch.IntTensor:
         return torch.narrow(self._token_lora_indices, 0, 0, x.size(0))
 
+    def _get_linear_lora_indices(self, x: torch.Tensor) -> torch.IntTensor:
+        if has_fused_lora_linear():
+            return torch.narrow(
+                self.token_mapping_meta.token_lora_mapping, 0, 0, x.size(0)
+            )
+        return self._get_token_lora_indices(x)
+
+    def has_active_lora(self, adapter_enabled_cpu: list[bool] | None = None) -> bool:
+        if self.no_lora:
+            return False
+        if adapter_enabled_cpu is None:
+            return True
+        return any(adapter_enabled_cpu[index] for index in self.active_lora_indices)
+
+    def get_active_lora_rank(
+        self,
+        adapter_ranks_cpu: list[int] | None,
+        max_lora_rank: int,
+    ) -> int:
+        if adapter_ranks_cpu is None or len(self.active_lora_indices) != 1:
+            return max_lora_rank
+        rank = adapter_ranks_cpu[self.active_lora_indices[0]]
+        if not 0 < rank <= max_lora_rank:
+            return max_lora_rank
+        return rank
+
     def _apply_shrink(
         self,
         y: torch.Tensor,
@@ -98,13 +151,20 @@ class PunicaWrapperXPU(PunicaWrapperBase):
         w_t_all: torch.Tensor,
         scale: float,
     ):
+        token_lora_indices = self._get_token_lora_indices(x)
+        # Fully-sharded callers may intentionally stage through the input
+        # dtype before copying into an FP32 or non-contiguous buffer.
+        if y.dtype == x.dtype and y.is_contiguous():
+            bgmv_shrink(x, w_t_all, y, token_lora_indices, scale)
+            return
+
         buf = torch.zeros(
             x.size(0),
             w_t_all.size(-2),
             dtype=x.dtype,
             device=x.device,
         )
-        bgmv_shrink(x, w_t_all, buf, self._get_token_lora_indices(x), scale)
+        bgmv_shrink(x, w_t_all, buf, token_lora_indices, scale)
         y.copy_(buf)
 
     def _apply_expand(
@@ -117,14 +177,12 @@ class PunicaWrapperXPU(PunicaWrapperBase):
         add_inputs: bool,
     ):
         token_lora_indices = self._get_token_lora_indices(x)
-        # After tensor-parallel all-gather (non-fully-sharded LoRA), x may
-        # have been gathered along the rank dim so x.size(1) == max_lora_rank
-        # * tp_size, while lora_b only uses max_lora_rank elements. The XPU
-        # C++ kernel requires inputs.size(1) == lora_b.size(-1), so truncate
-        # to the actual rank. x[:, :rank] is non-contiguous, hence the copy.
-        rank = w_t_all.size(-1)
-        if x.size(1) != rank:
-            x = x[:, :rank].contiguous()
+        # Fully-sharded all-gather can make x wider than the stored rank.
+        # A narrower x is intentional for a single active adapter whose rank
+        # is below the shared max-rank storage stride.
+        stored_rank = w_t_all.size(-1)
+        if x.size(1) > stored_rank:
+            x = x[:, :stored_rank].contiguous()
         bgmv_expand_slice(
             x, w_t_all, y, token_lora_indices, y_offset, y_slice_size, add_inputs
         )
@@ -220,6 +278,10 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             lora_b_stacked (torch.Tensor): lora_b's weights.
             add_inputs (bool): Default to True.
         """
+        adapter_enabled_cpu = kwargs.pop("adapter_enabled_cpu", None)
+        if not self.has_active_lora(adapter_enabled_cpu):
+            return
+
         token_lora_indices = self._get_token_lora_indices(x)
         bgmv_expand(x, lora_b_stacked, y, token_lora_indices, add_inputs)
 
@@ -255,6 +317,10 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             output_slices (tuple[int, ...]): Every slice's size.
             buffer (Optional[torch.Tensor]): Defaults to None.
         """
+        adapter_enabled_cpu = kwargs.pop("adapter_enabled_cpu", None)
+        if not self.has_active_lora(adapter_enabled_cpu):
+            return
+        adapter_ranks_cpu = kwargs.pop("adapter_ranks_cpu", None)
 
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
 
@@ -262,27 +328,49 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             "To minimize overhead, the buffer should be created by "
             ".add_lora_linear() instead of being passed in."
         )
-        r = lora_b_stacked[0].size(-1)
-        buffer = torch.zeros(  # type: ignore
-            (len(output_slices), x.size(0), r),
-            dtype=x.dtype,
-            device=x.device,
-        )
+        r = self.get_active_lora_rank(adapter_ranks_cpu, lora_b_stacked[0].size(-1))
         add_inputs = kwargs.pop("add_inputs", True)
-        self.add_shrink(
-            buffer,  # type: ignore
-            x,
-            lora_a_stacked,
-            scale,
-            **kwargs,
+        single_lora_index = getattr(self, "single_lora_index", None)
+        gemm_work = (
+            x.size(0) * r * (len(output_slices) * x.size(-1) + sum(output_slices))
         )
-        self.add_expand(
+        if (
+            single_lora_index is not None
+            and self.is_prefill
+            and gemm_work >= _SINGLE_LORA_GEMM_MIN_WORK
+            and x.dtype == lora_a_stacked[0].dtype
+            and y.dtype == x.dtype
+        ):
+            y = y.view(-1, y.shape[-1])
+            x = x.view(-1, x.shape[-1])
+            offset = 0
+            for lora_a, lora_b, output_slice in zip(
+                lora_a_stacked, lora_b_stacked, output_slices
+            ):
+                a = lora_a[single_lora_index, 0, :r]
+                b = lora_b[single_lora_index, 0, :output_slice, :r]
+                buffer = torch.mm(x, a.t())
+                y[:, offset : offset + output_slice].addmm_(
+                    buffer,
+                    b.t(),
+                    beta=1.0 if add_inputs else 0.0,
+                    alpha=scale,
+                )
+                offset += output_slice
+            return
+
+        x = x.view(-1, x.shape[-1])
+        y = y.view(-1, y.shape[-1])
+        bgmv_linear(
+            x,
+            list(lora_a_stacked),
+            list(lora_b_stacked),
             y,
-            buffer,  # type: ignore
-            lora_b_stacked,
-            output_slices,
+            self._get_linear_lora_indices(x),
+            list(output_slices),
+            r,
+            scaling=scale,
             add_inputs=add_inputs,
-            **kwargs,
         )
 
     @property
@@ -318,6 +406,10 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             scale (float): Scaling factor.
             buffer (Optional[torch.Tensor]): Default to None.
         """
+        adapter_enabled_cpu = kwargs.pop("adapter_enabled_cpu", None)
+        if not self.has_active_lora(adapter_enabled_cpu):
+            return
+
         y_org = y
         y = y.view(-1, y.shape[-1])
         x = x.view(-1, x.shape[-1])
@@ -445,6 +537,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
         offset: int = 0,
         token_lora_mapping: torch.Tensor | None = None,
         add_inputs: bool = True,
+        a_row_mapping: torch.Tensor | None = None,
+        c_row_mapping: torch.Tensor | None = None,
     ):
         """
         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
@@ -501,6 +595,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             fully_sharded,
             offset,
             add_inputs,
+            a_row_mapping,
+            c_row_mapping,
         )
 
     def add_lora_w13(
@@ -525,6 +621,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
         use_tuned_config: bool,
         add_inputs: bool = True,
         token_lora_mapping: torch.Tensor | None = None,
+        c_row_mapping: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -630,6 +727,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             fully_sharded=fully_sharded,
             token_lora_mapping=token_lora_mapping,
             add_inputs=add_inputs,
+            c_row_mapping=c_row_mapping,
         )
 
         return (
@@ -661,6 +759,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
         tp_rank: int,
         use_tuned_config: bool,
         add_inputs: bool = True,
+        row_mapping: torch.Tensor | None = None,
+        mul_routed_weight: bool = True,
     ) -> None:
         import functools
 
@@ -739,9 +839,11 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             shrink_config,
             expand_config,
             adapter_enabled,
-            True,  # mul_routed_weight
+            mul_routed_weight,
             fully_sharded=fully_sharded,
             offset=offset,
             token_lora_mapping=token_lora_mapping,
             add_inputs=add_inputs,
+            a_row_mapping=row_mapping,
+            c_row_mapping=row_mapping,
         )
