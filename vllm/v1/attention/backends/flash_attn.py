@@ -426,7 +426,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             and self.cache_config.cache_dtype == "int8_per_token_head"
         )
         if self._int8_kv_split:
-            self._init_reorder_batch_threshold(1)
+            self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -709,7 +709,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 num_prefill_reqs,
                 num_decode_tokens,
                 num_prefill_tokens,
-            ) = split_decodes_and_prefills(common_attn_metadata, decode_threshold=1)
+            ) = split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=True,
+            )
 
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -1331,10 +1335,16 @@ class FlashAttentionImpl(AttentionImpl):
             )
             return output
 
-        # Mixed batch (decodes first, see the metadata builder): decodes run
-        # on the native INT8 decode kernel; only the prefills are dequantized.
+        # Mixed batch (decodes first, see the metadata builder): decodes, incl.
+        # uniform spec-decode verification, run on the native INT8 decode
+        # kernel; only the prefills are dequantized.
         nd = attn_metadata.num_decode_reqs if dynamic_causal is None else 0
         ndt = attn_metadata.num_decode_tokens if nd > 0 else 0
+        dq = ndt // nd if nd > 0 else 0
+        if dq > 1 and (
+            ndt != nd * dq or not causal or not self._int8_kv_spec_decode_supported(dq)
+        ):
+            nd = ndt = 0
         qsl = attn_metadata.query_start_loc
         if nd > 0:
             flash_attn_varlen_func(
@@ -1349,11 +1359,13 @@ class FlashAttentionImpl(AttentionImpl):
                         q=query[:ndt],
                         out=output[:ndt],
                         cu_seqlens_q=qsl[: nd + 1],
-                        max_seqlen_q=1,
+                        max_seqlen_q=dq,
                         seqused_k=attn_metadata.seq_lens[:nd],
                     )
                 ),
             )
+            if ndt == n:
+                return output
             kwargs |= dict(
                 q=query[ndt:n],
                 out=output[ndt:n],
@@ -1379,6 +1391,17 @@ class FlashAttentionImpl(AttentionImpl):
             **kwargs,
         )
         return output
+
+    def _int8_kv_spec_decode_supported(self, q_len: int) -> bool:
+        """Whether vllm-xpu-kernels runs a uniform causal q_len batch through
+        its split-K decode path (the only path that reads INT8 KV)."""
+        from vllm_xpu_kernels import flash_attn_interface
+
+        return (
+            q_len <= getattr(flash_attn_interface, "_SPEC_DECODE_MAX_QLEN", 1)
+            and not self.logits_soft_cap
+            and self.alibi_slopes is None
+        )
 
     def do_kv_cache_update(
         self,

@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """int8_per_token_head KV cache on the XPU FLASH_ATTN backend.
 
-Decode rows run on the native INT8 paged decode kernel; prefill rows are
-dequantized into a query-dtype scratch cache and run on the regular kernel.
+Decode rows (incl. uniform spec-decode verification rows) run on the native
+INT8 paged decode kernel; prefill rows are dequantized into a query-dtype
+scratch cache and run on the regular kernel.
 Outputs are compared with an fp32 reference on the same quantized cache
 (prefill rows: K/V rounded to the query dtype first, as the scratch is).
 """
@@ -23,7 +24,21 @@ CASES = {  # (seq_lens, q_lens), decodes first as the metadata builder orders
     "decode": ([17, 64, 200, 129], [1, 1, 1, 1]),
     "prefill": ([17, 64, 200, 129], [17, 33, 77, 129]),
     "mixed": ([64, 200, 1, 129, 300], [1, 1, 1, 40, 300]),
+    "spec_decode": ([17, 64, 200, 129], [4, 4, 4, 4]),
+    "spec_mixed": ([64, 200, 129, 300], [4, 4, 40, 300]),
 }
+SPEC_THRESHOLD = 4  # 1 + num_speculative_tokens, as the metadata builder sets
+
+
+def _num_decodes(q_lens):
+    """Leading uniform rows <= threshold (split_decodes_and_prefills with
+    require_uniform=True); 0 for pure decode, which takes its own branch."""
+    if max(q_lens) == 1 or q_lens[0] > SPEC_THRESHOLD:
+        return 0
+    nd = 0
+    while nd < len(q_lens) and q_lens[nd] == q_lens[0]:
+        nd += 1
+    return nd
 
 
 def _make_cache(seq_lens, hkv, d, dtype, gen):
@@ -75,11 +90,7 @@ def _attend(q, k, v, scale, q_pos):
     return torch.einsum("hqk,khd->qhd", p, v)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("d,hq,hkv", [(128, 32, 8), (256, 16, 4)])
-@pytest.mark.parametrize("case", list(CASES))
-@torch.inference_mode()
-def test_int8_kv_forward(dtype, d, hq, hkv, case):
+def _run(case, dtype, d, hq, hkv):
     from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
     seq_lens, q_lens = CASES[case]
@@ -91,7 +102,7 @@ def test_int8_kv_forward(dtype, d, hq, hkv, case):
     qsl = torch.tensor(
         [0] + torch.tensor(q_lens).cumsum(0).tolist(), dtype=torch.int32, device="xpu"
     )
-    nd = sum(x == 1 for x in q_lens) if max(q_lens) > 1 else 0
+    nd = _num_decodes(q_lens)
     md = SimpleNamespace(
         use_cascade=False,
         num_actual_tokens=n,
@@ -104,7 +115,7 @@ def test_int8_kv_forward(dtype, d, hq, hkv, case):
         block_table=bt,
         max_num_splits=0,
         num_decode_reqs=nd,
-        num_decode_tokens=nd,
+        num_decode_tokens=sum(q_lens[:nd]),
     )
     impl = SimpleNamespace(
         scale=d**-0.5,
@@ -120,7 +131,19 @@ def test_int8_kv_forward(dtype, d, hq, hkv, case):
     impl._int8_kv_cache_views = lambda kv: FlashAttentionImpl._int8_kv_cache_views(
         impl, kv
     )
+    impl._int8_kv_spec_decode_supported = lambda q_len: (
+        FlashAttentionImpl._int8_kv_spec_decode_supported(impl, q_len)
+    )
     FlashAttentionImpl._forward_int8_kv_xpu(impl, q, kv_cache, md, out)
+    return seq_lens, q_lens, nd, views, bt, qsl, q, out
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("d,hq,hkv", [(128, 32, 8), (256, 16, 4)])
+@pytest.mark.parametrize("case", list(CASES))
+@torch.inference_mode()
+def test_int8_kv_forward(dtype, d, hq, hkv, case):
+    seq_lens, q_lens, nd, views, bt, qsl, q, out = _run(case, dtype, d, hq, hkv)
 
     assert torch.isfinite(out).all()
     ref = []
@@ -154,3 +177,33 @@ def test_dequant_to_scratch_zeroes_tail_slots():
         got = scratch[sbt[b, : (n + BLOCK - 1) // BLOCK].long()].flatten(0, 1)[:n]
         torch.testing.assert_close(got[..., :128].float(), k.to(torch.bfloat16).float())
         torch.testing.assert_close(got[..., 128:].float(), v.to(torch.bfloat16).float())
+
+
+@pytest.mark.parametrize("case", ["spec_decode", "spec_mixed"])
+@pytest.mark.parametrize("fast_path", [True, False])
+@torch.inference_mode()
+def test_spec_decode_rows_skip_dequant(monkeypatch, case, fast_path):
+    """Uniform verification rows must not dequantize the whole context every
+    step; when the kernel's spec fast path cannot take them they fall back to
+    the dequant path (and stay correct, see test_int8_kv_forward)."""
+    from vllm_xpu_kernels import flash_attn_interface
+
+    from vllm.v1.attention.ops import xpu_int8_kv
+
+    if not fast_path:
+        monkeypatch.setattr(flash_attn_interface, "_SPEC_DECODE_MAX_QLEN", 1)
+    calls = []
+    real = xpu_int8_kv.dequant_to_scratch
+
+    def spy(kc, vc, ks, vs, block_table, *args):
+        calls.append(block_table.shape[0])
+        return real(kc, vc, ks, vs, block_table, *args)
+
+    monkeypatch.setattr(xpu_int8_kv, "dequant_to_scratch", spy)
+    seq_lens, q_lens, nd, *_, out = _run(case, torch.bfloat16, 128, 32, 8)
+    assert torch.isfinite(out).all()
+    if fast_path:
+        expected = [len(seq_lens) - nd] if len(seq_lens) > nd else []
+    else:
+        expected = [len(seq_lens)]
+    assert calls == expected
